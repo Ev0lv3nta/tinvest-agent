@@ -1,5 +1,6 @@
 """Супервизор: доставка без потерь, наблюдатели, сверка."""
 
+import json
 import time
 import unittest
 
@@ -354,27 +355,91 @@ class McpStatus(JournalCase):
         self.assertIn("Торговые инструменты недоступны", block)
 
 
-class Usage(JournalCase):
-    def setUp(self):
-        super().setUp()
-        self.supervisor = supervisor_main.Supervisor.__new__(supervisor_main.Supervisor)
+class ProtocolShapes(JournalCase):
+    """Формы, снятые со схемы протокола codex app-server 0.149."""
 
-    def test_расход_читается_из_своего_события(self):
-        self.supervisor._record_usage(
+    def test_расход_читается_из_вложенных_полей(self):
+        supervisor_main.Supervisor._record_usage(
             {
+                "threadId": "T",
                 "turnId": "t1",
                 "tokenUsage": {
-                    "inputTokens": 120000, "outputTokens": 3000, "totalTokens": 123000,
-                    "contextUsedTokens": 78000, "contextWindow": 200000,
+                    "last": {
+                        "inputTokens": 120000, "cachedInputTokens": 90000,
+                        "outputTokens": 3000, "reasoningOutputTokens": 1200,
+                        "totalTokens": 123000, "cacheWriteInputTokens": 0,
+                    },
+                    "total": {"totalTokens": 480000},
+                    "modelContextWindow": 258400,
                 },
             }
         )
         stats = journal.usage_since(3600)
+        self.assertEqual(stats["input"], 120000)
+        self.assertEqual(stats["output"], 3000)
         self.assertEqual(stats["total"], 123000)
-        self.assertEqual(stats["context_used"], 78000)
+        # Занятость окна — вход последнего хода плюс его выход.
+        self.assertEqual(stats["context_used"], 123000)
+        self.assertEqual(stats["context_window"], 258400)
 
-    def test_чужая_форма_не_ломает(self):
-        self.supervisor._record_usage({"turnId": "t2", "tokenUsage": {"unknown": 1}})
-        self.supervisor._record_usage({"turnId": "t3"})
-        self.supervisor._record_usage({"turnId": "t4", "tokenUsage": "строка"})
-        self.assertEqual(journal.usage_since(3600)["turns"], 2)
+    def test_плоская_форма_больше_не_принимается_молча(self):
+        # Так поле выглядело в ошибочной догадке: значений нет, но и падения нет.
+        supervisor_main.Supervisor._record_usage(
+            {"turnId": "t2", "tokenUsage": {"inputTokens": 5, "modelContextWindow": 100}}
+        )
+        stats = journal.usage_since(3600)
+        self.assertEqual(stats["turns"], 1)
+        self.assertEqual(stats["input"], 0)
+        # Окно берётся из строки, где известна занятость; здесь её нет.
+        self.assertEqual(stats["context_used"], 0)
+
+    def test_мусор_вместо_расхода_не_ломает(self):
+        supervisor_main.Supervisor._record_usage({"turnId": "t3"})
+        supervisor_main.Supervisor._record_usage({"turnId": "t4", "tokenUsage": "строка"})
+        supervisor_main.Supervisor._record_usage({"turnId": "t5", "tokenUsage": {"last": 5}})
+        self.assertEqual(journal.usage_since(3600)["turns"], 1)
+
+    def test_подтверждение_получает_решение_а_не_ошибку(self):
+        from supervisor import appserver
+
+        sent = []
+
+        class Fake(appserver.AppServer):
+            def __init__(self):
+                self._lock = __import__("threading").Lock()
+                self.process = self
+
+            def alive(self):
+                return True
+
+            class stdin:
+                @staticmethod
+                def write(line):
+                    sent.append(line)
+
+                @staticmethod
+                def flush():
+                    pass
+
+        server = Fake()
+        server._answer_request({"id": 1, "method": "item/commandExecution/requestApproval"})
+        server._answer_request({"id": 2, "method": "item/tool/requestUserInput"})
+        server._answer_request({"id": 3, "method": "account/chatgptAuthTokens/refresh"})
+        answers = [json.loads(x) for x in sent]
+        self.assertEqual(answers[0]["result"]["decision"], "acceptForSession")
+        self.assertEqual(answers[1]["result"]["answers"], {})
+        self.assertIn("error", answers[2])
+        self.assertEqual(
+            journal.connect().execute(
+                "SELECT COUNT(*) FROM events WHERE kind='appserver_request'"
+            ).fetchone()[0],
+            3,
+        )
+
+    def test_turn_completed_без_usage(self):
+        # У Turn нет поля usage: только completedAt, durationMs, error, id,
+        # items, startedAt, status. Прежний код читал несуществующее.
+        from supervisor import appserver
+
+        self.assertNotIn("usage", ("completedAt", "durationMs", "error", "id",
+                                   "items", "itemsView", "startedAt", "status"))

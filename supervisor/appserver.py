@@ -18,6 +18,21 @@ from typing import Any, Optional
 from gateway import journal
 
 
+# Запросы, на которые сервер ждёт решения человека. Человека здесь нет, а
+# доступ уже выдан конфигурацией (approval_policy = never, полный доступ к
+# файлам), поэтому отказ противоречил бы собственным настройкам стенда и
+# оборвал бы ход на середине. Отвечаем согласием и записываем факт: при
+# текущей конфигурации такие запросы приходить не должны вовсе.
+APPROVAL_REQUESTS = {
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "applyPatchApproval",
+    "execCommandApproval",
+}
+INPUT_REQUESTS = {"item/tool/requestUserInput"}
+
+
 class AppServerError(RuntimeError):
     pass
 
@@ -144,33 +159,43 @@ class AppServer:
                 # Запрос от сервера: подтверждение, запрос ввода и подобное.
                 # Молчание подвесило бы ход — отвечаем явным отказом, чтобы
                 # агент увидел причину и продолжил сам.
-                self._decline(message)
+                self._answer_request(message)
             else:
                 self._track(message)
                 self.events.put(message)
         self._fail_pending("app-server закрыл поток")
 
-    def _decline(self, message: dict) -> None:
+    def _answer_request(self, message: dict) -> None:
+        """Ответить на запрос сервера. Молчание подвесило бы ход.
+
+        Формы ответов взяты из схемы протокола: у запросов подтверждения это
+        `{"decision": ...}`, у запроса ввода — `{"answers": {}}`.
+        """
         method = message.get("method", "")
         journal.log_event("appserver_request", {"method": method})
+
+        if method in APPROVAL_REQUESTS:
+            payload = {"result": {"decision": "acceptForSession"}}
+        elif method in INPUT_REQUESTS:
+            # Отвечать некому: пустой ответ честнее выдуманного.
+            payload = {"result": {"answers": {}}}
+        else:
+            payload = {
+                "error": {
+                    "code": -32601,
+                    "message": (
+                        f"метод {method} супервизором не поддерживается: "
+                        f"агент работает автономно, человека в цикле нет"
+                    ),
+                }
+            }
+
         with self._lock:
             if not self.alive():
                 return
             self.process.stdin.write(
                 json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": message["id"],
-                        "error": {
-                            "code": -32601,
-                            "message": (
-                                f"метод {method} не поддерживается супервизором: "
-                                f"агент работает автономно, интерактивных "
-                                f"подтверждений нет"
-                            ),
-                        },
-                    },
-                    ensure_ascii=False,
+                    {"jsonrpc": "2.0", "id": message["id"], **payload}, ensure_ascii=False
                 )
                 + "\n"
             )

@@ -470,33 +470,45 @@ class Supervisor:
             self.last_report_date = today
             journal.kv_set("last_report_date", today)
 
-    def _record_usage(self, params: dict) -> None:
-        usage = params.get("tokenUsage") or {}
+    @staticmethod
+    def _record_usage(params: dict) -> None:
+        """Расход хода из thread/tokenUsage/updated.
+
+        Форма взята из схемы протокола: ThreadTokenUsage = {last, total,
+        modelContextWindow}, где last и total — разбивка по видам токенов.
+        Поля вложены, а не лежат сверху; у turn/completed поля usage нет
+        вовсе — там только completedAt, durationMs, error, id, items,
+        startedAt и status.
+        """
+        usage = params.get("tokenUsage")
         if not isinstance(usage, dict):
             return
-        # Форма поля у разных версий Codex отличается, поэтому читаем то,
-        # что есть, и не падаем на отсутствующем.
-        def pick(*names):
-            for name in names:
-                value = usage.get(name)
-                if isinstance(value, (int, float)):
-                    return int(value)
-                if isinstance(value, dict):
-                    inner = value.get("total") or value.get("tokens")
-                    if isinstance(inner, (int, float)):
-                        return int(inner)
-            return None
+        last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
+        total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
+
+        def num(source: dict, name: str):
+            value = source.get(name)
+            return int(value) if isinstance(value, (int, float)) else None
+
+        window = usage.get("modelContextWindow")
+        # Сколько занято в окне: последний ход целиком пересылает разговор,
+        # поэтому его вход плюс выход и есть текущее наполнение контекста.
+        used = None
+        if isinstance(last, dict):
+            parts = [num(last, "inputTokens"), num(last, "outputTokens")]
+            if any(p is not None for p in parts):
+                used = sum(p or 0 for p in parts)
 
         journal.log_usage(
             params.get("turnId") or "",
             {
-                "input": pick("inputTokens", "input"),
-                "cached": pick("cachedInputTokens", "cached"),
-                "output": pick("outputTokens", "output"),
-                "reasoning": pick("reasoningOutputTokens", "reasoning"),
-                "total": pick("totalTokens", "total"),
-                "context_used": pick("contextUsedTokens", "usedContextWindow"),
-                "context_window": pick("contextWindow", "modelContextWindow"),
+                "input": num(last, "inputTokens"),
+                "cached": num(last, "cachedInputTokens"),
+                "output": num(last, "outputTokens"),
+                "reasoning": num(last, "reasoningOutputTokens"),
+                "total": num(last, "totalTokens") or num(total, "totalTokens"),
+                "context_used": used,
+                "context_window": int(window) if isinstance(window, (int, float)) else None,
             },
         )
 
@@ -700,7 +712,15 @@ class Supervisor:
                 # Настоящий расход приходит отдельным thread/tokenUsage/updated,
                 # и до этой правки в журнал писались нули.
                 turn = params.get("turn") or {}
-                journal.log_event("turn_completed", {"turn_id": turn.get("id", "")})
+                journal.log_event(
+                    "turn_completed",
+                    {
+                        "turn_id": turn.get("id", ""),
+                        "status": turn.get("status"),
+                        "duration_sec": round((turn.get("durationMs") or 0) / 1000, 1),
+                        "error": str(turn.get("error"))[:200] if turn.get("error") else None,
+                    },
+                )
                 journal.log_transcript("turnEnd", thread_id=thread_id, is_own=own)
             elif method == "thread/tokenUsage/updated" and own:
                 self._record_usage(params)
