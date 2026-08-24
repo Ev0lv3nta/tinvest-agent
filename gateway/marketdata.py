@@ -426,3 +426,34 @@ def spill(tool: str, payload: Any, text: str) -> dict:
         ),
         "preview": text[:400],
     }
+
+
+# --- слежение за страницей ------------------------------------------------
+
+_TAGS = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.S | re.I)
+_MARKUP = re.compile(r"<[^>]+>")
+_SPACE = re.compile(r"\s+")
+
+
+def page_text(url: str, timeout: int = 20) -> str:
+    """Видимый текст страницы. Разметка и пробелы выброшены.
+
+    Нужен, чтобы отличить настоящее изменение от переставленного баннера:
+    хеш сырого HTML меняется почти на каждой перезагрузке.
+    """
+    import urllib.request
+
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "tinvest-agent/1.0 (disclosure watcher)"}
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read(2_000_000).decode("utf-8", "replace")
+    text = _TAGS.sub(" ", raw)
+    text = _MARKUP.sub(" ", text)
+    return _SPACE.sub(" ", text).strip()
+
+
+def page_hash(url: str, timeout: int = 20) -> str:
+    import hashlib
+
+    return hashlib.sha256(page_text(url, timeout).encode("utf-8")).hexdigest()

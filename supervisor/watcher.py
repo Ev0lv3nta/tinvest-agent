@@ -24,6 +24,10 @@ from gateway.tinvest import SandboxClient, TInvestError
 INTERVAL_MARKET = 30.0
 INTERVAL_CLOSED = 300.0
 
+# Страницы раскрытия меняются редко; чаще пяти минут смысла нет, а лишний
+# трафик к эмитенту ни к чему.
+URL_INTERVAL = 300.0
+
 
 def satisfied(row, price: float) -> bool:
     kind = row["kind"]
@@ -67,9 +71,13 @@ class Watcher(threading.Thread):
         self.running = True
 
     def run(self) -> None:
+        last_urls = 0.0
         while self.running:
             try:
                 self.tick()
+                if time.time() - last_urls >= URL_INTERVAL:
+                    last_urls = time.time()
+                    self.tick_urls()
             except Exception as exc:  # noqa: BLE001 — поток не должен падать
                 journal.log_event("watcher_error", {"error": repr(exc)[:300]})
             time.sleep(INTERVAL_MARKET if self.market_open() else INTERVAL_CLOSED)
@@ -102,6 +110,34 @@ class Watcher(threading.Thread):
             fired.append(describe(row, float(price)))
         if fired:
             journal.log_event("watches_fired", {"count": len(fired), "texts": fired})
+            self.on_fire(fired)
+        return fired
+
+    def tick_urls(self) -> list[str]:
+        """Страницы проверяются и вне торгов: раскрытие выходит когда угодно."""
+        from gateway import marketdata
+
+        rows = [row for row in journal.active_watches() if row["kind"] == "url_changed"]
+        fired = []
+        for row in rows:
+            try:
+                current = marketdata.page_hash(row["url"])
+            except Exception as exc:  # noqa: BLE001 — сайт эмитента может лежать
+                journal.log_event(
+                    "url_watch_failed", {"url": row["url"], "error": str(exc)[:200]}
+                )
+                continue
+            if not row["content_hash"]:
+                journal.set_watch_hash(row["id"], current)
+                continue
+            if current == row["content_hash"]:
+                continue
+            journal.mark_watch_fired(row["id"], 0.0)
+            fired.append(
+                f"Изменилась страница {row['url']}. Твоя заметка: {row['note']}"
+            )
+        if fired:
+            journal.log_event("url_watches_fired", {"count": len(fired), "texts": fired})
             self.on_fire(fired)
         return fired
 

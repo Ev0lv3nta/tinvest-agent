@@ -828,12 +828,57 @@ def tool_watch(
     }
 
 
+@tool(
+    "watch_url",
+    "Следить за страницей: раз в несколько минут код скачивает её и сверяет "
+    "хеш видимого текста. Изменилась — тебя разбудят.\n"
+    "Так проверяют раскрытие отчётности, решения совета директоров, "
+    "сообщения эмитента. Не спрашивай поиск «вышел ли отчёт» по таймеру: за "
+    "прошлый прогон один и тот же вопрос был задан тринадцать раз за шесть "
+    "часов, каждый раз за десятки тысяч токенов квоты, и все тринадцать "
+    "ответов были «пока нет».",
+    _obj(
+        {
+            "url": {"type": "string", "description": "страница раскрытия"},
+            "note": {"type": "string", "description": "чего ждёшь и что делать"},
+            "hours": {"type": "number", "description": "срок жизни, по умолчанию 24"},
+        },
+        ["url", "note"],
+    ),
+)
+def tool_watch_url(url: str, note: str, hours: float = 24.0) -> dict:
+    if not str(url).lower().startswith(("http://", "https://")):
+        raise ValueError("нужен http- или https-адрес")
+    if not str(note).strip():
+        raise ValueError("заметка обязательна")
+    current = marketdata.page_hash(url)
+    hours = max(0.1, min(float(hours or 24), 168))
+    watch_id = journal.add_watch(
+        url,
+        "",
+        "url_changed",
+        0.0,
+        str(note)[:400],
+        time.time() + hours * 3600,
+        url=url,
+        content_hash=current,
+    )
+    return {
+        "id": watch_id,
+        "url": url,
+        "baseline_hash": current[:12],
+        "expires_msk": datetime.fromtimestamp(
+            time.time() + hours * 3600, MSK
+        ).strftime("%Y-%m-%d %H:%M"),
+    }
+
+
 @tool("watches", "Активные условия наблюдения.", _obj({}))
 def tool_watches() -> list[dict]:
     return [
         {
             "id": row["id"],
-            "ticker": row["ticker"],
+            "ticker": row["ticker"] or row["url"],
             "condition": row["kind"],
             "value": row["threshold"],
             "note": row["note"],

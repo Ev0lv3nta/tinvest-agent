@@ -267,3 +267,56 @@ class FakeReconcileBroker:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UrlWatches(JournalCase):
+    def test_изменение_страницы_будит(self):
+        from gateway import marketdata
+
+        pages = {"u": "первая версия"}
+        marketdata.page_hash = lambda url, timeout=20: __import__("hashlib").sha256(
+            pages[url].encode()
+        ).hexdigest()
+
+        journal.add_watch(
+            "u", "", "url_changed", 0.0, "ждём МСФО", time.time() + 3600,
+            url="u", content_hash=marketdata.page_hash("u"),
+        )
+        worker = watcher.Watcher(
+            supervisor_main.Supervisor._watches_fired, lambda: False, lambda: None
+        )
+        # Ничего не изменилось — тишина, и наблюдатель остаётся.
+        self.assertEqual(worker.tick_urls(), [])
+        self.assertEqual(len(journal.active_watches()), 1)
+
+        pages["u"] = "опубликован отчёт за первое полугодие"
+        fired = worker.tick_urls()
+        self.assertEqual(len(fired), 1)
+        self.assertIn("ждём МСФО", fired[0])
+        self.assertEqual(journal.active_watches(), [])
+        self.assertEqual(len(journal.peek_messages()), 1)
+
+    def test_недоступная_страница_не_ломает_наблюдение(self):
+        from gateway import marketdata
+
+        def broken(url, timeout=20):
+            raise OSError("сайт лежит")
+
+        marketdata.page_hash = broken
+        journal.add_watch(
+            "u", "", "url_changed", 0.0, "ждём", time.time() + 3600,
+            url="u", content_hash="старый",
+        )
+        worker = watcher.Watcher(lambda t: None, lambda: False, lambda: None)
+        self.assertEqual(worker.tick_urls(), [])
+        self.assertEqual(len(journal.active_watches()), 1)
+
+    def test_разметка_не_влияет_на_хеш(self):
+        import importlib
+
+        from gateway import marketdata as md
+
+        importlib.reload(md)
+        a = md._SPACE.sub(" ", md._MARKUP.sub(" ", md._TAGS.sub(" ", "<div>Отчёт <b>вышел</b></div>")))
+        b = md._SPACE.sub(" ", md._MARKUP.sub(" ", md._TAGS.sub(" ", "<p>Отчёт  <i>вышел</i></p><script>x=1</script>")))
+        self.assertEqual(a.strip(), b.strip())

@@ -164,6 +164,8 @@ MIGRATIONS = [
     ("orders", "card", "TEXT"),
     ("orders", "closed_ts", "REAL"),
     ("watches", "base_price", "REAL"),
+    ("watches", "url", "TEXT"),
+    ("watches", "content_hash", "TEXT"),
 ]
 
 
@@ -634,7 +636,7 @@ def usage_since(seconds: float) -> dict:
 # --- наблюдатели ----------------------------------------------------------
 
 MAX_ACTIVE_WATCHES = 20
-WATCH_KINDS = ("price_above", "price_below", "pct_move")
+WATCH_KINDS = ("price_above", "price_below", "pct_move", "url_changed")
 
 
 def add_watch(
@@ -645,6 +647,8 @@ def add_watch(
     note: str,
     expires_ts: float,
     base_price: Optional[float] = None,
+    url: str = "",
+    content_hash: str = "",
 ) -> int:
     if kind not in WATCH_KINDS:
         raise ValueError(f"условие должно быть одним из {', '.join(WATCH_KINDS)}")
@@ -656,10 +660,11 @@ def add_watch(
         raise ValueError(f"уже {active} наблюдателей при лимите {MAX_ACTIVE_WATCHES}")
     cursor = conn.execute(
         "INSERT INTO watches (created_ts, instrument_id, ticker, kind, threshold, note,"
-        " expires_ts, base_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " expires_ts, base_price, url, content_hash)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             time.time(), instrument_id, ticker, kind, float(threshold), note,
-            expires_ts, base_price,
+            expires_ts, base_price, url, content_hash,
         ),
     )
     conn.commit()
@@ -684,6 +689,12 @@ def cancel_watch(watch_id: int) -> bool:
     )
     conn.commit()
     return cursor.rowcount > 0
+
+
+def set_watch_hash(watch_id: int, content_hash: str) -> None:
+    conn = connect()
+    conn.execute("UPDATE watches SET content_hash = ? WHERE id = ?", (content_hash, watch_id))
+    conn.commit()
 
 
 def mark_watch_fired(watch_id: int, value: float) -> None:
