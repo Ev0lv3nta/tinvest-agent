@@ -27,6 +27,12 @@ MAX_ORDERS_PER_HOUR = 30
 ALLOW_LEVERAGE = False
 ALLOW_SHORT = False
 
+# Порог остановки. Падение стоимости портфеля ниже — конец прогона:
+# торговля блокируется, супервизор перестаёт будить агента, дальше
+# нужно вмешательство человека. Снимается только вручную.
+CAPITAL_FLOOR = 30_000.0
+STARTING_CAPITAL = 100_000.0
+
 SEARCH_MODEL = "gpt-5.6-luna"
 SEARCH_TIMEOUT = 180
 HTTP_TIMEOUT = 60

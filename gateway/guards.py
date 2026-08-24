@@ -15,6 +15,40 @@ class GuardRejection(RuntimeError):
     """Заявка отклонена ограничителем. Текст уходит агенту как результат."""
 
 
+HALT_KEY = "halted"
+
+
+def halted() -> str:
+    """Причина остановки, если прогон остановлен. Пустая строка — работаем."""
+    return journal.kv_get(HALT_KEY, "") or ""
+
+
+def halt(reason: str) -> None:
+    if not halted():
+        journal.kv_set(HALT_KEY, reason)
+        journal.log_event("halt", {"reason": reason})
+
+
+def check_not_halted() -> None:
+    reason = halted()
+    if reason:
+        raise GuardRejection(
+            f"Прогон остановлен: {reason}\n"
+            f"Торговые операции заблокированы. Возобновить может только человек. "
+            f"Опиши в заметках, что произошло и что бы ты сделал иначе."
+        )
+
+
+def check_capital_floor(total: float) -> None:
+    """Порог остановки: ниже него прогон считается проигранным и закрывается."""
+    if total < config.CAPITAL_FLOOR:
+        halt(
+            f"стоимость портфеля {total:.2f} ₽ опустилась ниже порога "
+            f"{config.CAPITAL_FLOOR:.0f} ₽"
+        )
+        check_not_halted()
+
+
 def check_rate_limit() -> None:
     recent = journal.orders_last_hour()
     if recent >= config.MAX_ORDERS_PER_HOUR:

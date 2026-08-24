@@ -17,6 +17,7 @@ import traceback
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -63,6 +64,44 @@ def _parse_when(value: str) -> float:
     return parsed.timestamp()
 
 
+def _telegram_document(path: str, caption: str) -> bool:
+    """Отправка файла в Telegram: multipart собираем вручную, без зависимостей."""
+    token = config.secret("TELEGRAM_BOT_TOKEN")
+    chat_id = config.secret("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return False
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise ValueError(f"файл не найден: {path}")
+
+    boundary = f"----tinvest{uuid.uuid4().hex}"
+    parts: list[bytes] = []
+    for name, value in (("chat_id", chat_id), ("caption", caption[:1000])):
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+            f"{value}\r\n".encode()
+        )
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\";"
+        f" filename=\"{file_path.name}\"\r\n"
+        f"Content-Type: text/markdown\r\n\r\n".encode()
+    )
+    parts.append(file_path.read_bytes())
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendDocument",
+        data=b"".join(parts),
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.loads(response.read()).get("ok", False)
+    except Exception:
+        return False
+
+
 def _telegram(text: str) -> bool:
     token = config.secret("TELEGRAM_BOT_TOKEN")
     chat_id = config.secret("TELEGRAM_CHAT_ID")
@@ -83,7 +122,12 @@ def _telegram(text: str) -> bool:
 
 def _order(direction: str, instrument_id: str, lots: int, price, rationale: str) -> dict:
     api = client()
+    guards.check_not_halted()
     guards.check_rate_limit()
+
+    # Порог проверяется перед каждой сделкой по свежему портфелю, а не по
+    # кешу: между вызовами цена позиций могла уехать.
+    guards.check_capital_floor(api.portfolio()["total"])
 
     limits = api.max_lots(instrument_id, price)
     info = api.find_instrument(instrument_id, limit=1)
@@ -147,6 +191,13 @@ def _obj(properties: dict, required: list[str] | None = None) -> dict:
 def tool_portfolio() -> dict:
     data = client().portfolio()
     journal.log_snapshot(data["total"], data["cash"], data["positions"])
+    data["result_vs_start"] = round(data["total"] - config.STARTING_CAPITAL, 2)
+    data["result_percent"] = round(
+        (data["total"] / config.STARTING_CAPITAL - 1) * 100, 2
+    )
+    data["capital_floor"] = config.CAPITAL_FLOOR
+    if guards.halted():
+        data["halted"] = guards.halted()
     return data
 
 
@@ -344,6 +395,40 @@ def tool_notify(text: str) -> dict:
     delivered = _telegram(text)
     journal.log_event("notify", {"text": text, "delivered": delivered})
     return {"delivered": delivered}
+
+
+@tool(
+    "send_report",
+    "Отправить оператору дневной отчёт: короткая выжимка текстом и полный "
+    "разбор файлом. Файл готовь заранее в notes/reports/ГГГГ-ММ-ДД.md. "
+    "В выжимке — результат дня, главное решение и что планируешь завтра; "
+    "подробности в файле.",
+    _obj(
+        {
+            "summary": {
+                "type": "string",
+                "description": "3-6 строк: итог дня, ключевое решение, план",
+            },
+            "path": {"type": "string", "description": "путь к markdown-файлу"},
+        },
+        ["summary", "path"],
+    ),
+)
+def tool_send_report(summary: str, path: str) -> dict:
+    portfolio = client().portfolio()
+    result = portfolio["total"] - config.STARTING_CAPITAL
+    header = (
+        f"Отчёт за {datetime.now(MSK):%d.%m.%Y}\n"
+        f"Портфель: {portfolio['total']:,.0f} ₽  "
+        f"({result:+,.0f} ₽, {result / config.STARTING_CAPITAL * 100:+.2f}%)\n\n"
+    ).replace(",", " ")
+    sent_text = _telegram(header + summary)
+    sent_file = _telegram_document(path, f"Подробный отчёт за {datetime.now(MSK):%d.%m.%Y}")
+    journal.log_event(
+        "daily_report",
+        {"summary": summary, "path": path, "text": sent_text, "file": sent_file},
+    )
+    return {"text_delivered": sent_text, "file_delivered": sent_file}
 
 
 # --- цикл JSON-RPC --------------------------------------------------------
