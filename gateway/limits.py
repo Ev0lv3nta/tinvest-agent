@@ -77,7 +77,13 @@ def fetch(force: bool = False) -> dict:
                 "used": used,
                 "total": total,
                 "remaining": int(session.get("remaining") or 0),
-                "percent": round(used / total * 100, 1) if total else 0.0,
+                # У безлимитного аккаунта total = 0, и деление дало бы 0%,
+                # то есть «всё свободно» вместо «лимита нет».
+                "percent": (
+                    round(used / total * 100, 1)
+                    if total
+                    else (0.0 if session.get("unlimited") else None)
+                ),
                 "unlimited": bool(session.get("unlimited")),
                 "reset_at": session.get("resetAt") or "",
                 "banked": item.get("bankedResetCredits") or 0,

@@ -16,6 +16,7 @@
 
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -25,6 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from gateway import config
 
 WORKDIR = Path("/home/agent/work")
+# Архив кладётся ВНЕ рабочей директории. Иначе агент его находит: в прошлый
+# раз он так и сделал — восстановил заметки из архива и записал процедуру
+# восстановления в lessons.md, то есть чистого листа не получилось.
+ARCHIVE_DIR = Path("/home/agent/archive")
+SERVICE = "tinvest-agent"
 
 # Что стирается: всё, что описывает текущий разговор и наблюдения за ним.
 WIPE = ["transcript", "tool_calls", "events", "wakeups", "messages", "snapshots"]
@@ -33,6 +39,52 @@ KEEP = ["orders"]
 # Ключи состояния, которые надо сохранить: сдвиг Telegram, иначе бот
 # заново обработает старые сообщения.
 KEEP_KEYS = ["tg_offset"]
+
+
+def stop_service() -> bool:
+    """Сброс на живом супервизоре бессмыслен: он держит thread_id в памяти
+    и продолжит старый разговор после очистки ключей."""
+    result = subprocess.run(
+        ["systemctl", "stop", SERVICE], capture_output=True, text=True, check=False
+    )
+    if result.returncode == 0:
+        print(f"остановлен {SERVICE}")
+        return True
+    print(f"не удалось остановить {SERVICE}: {result.stderr.strip()[:200]}")
+    return False
+
+
+def start_service() -> None:
+    result = subprocess.run(
+        ["systemctl", "start", SERVICE], capture_output=True, text=True, check=False
+    )
+    print(
+        f"{SERVICE} запущен" if result.returncode == 0
+        else f"{SERVICE} НЕ запущен: {result.stderr.strip()[:200]}"
+    )
+
+
+def backup_database(path: Path, target: Path) -> None:
+    """Копия через backup API, а не shutil.copy2.
+
+    База в режиме WAL: обычное копирование файла берёт его без журнала
+    записи, и в копии не хватает последних транзакций — вплоть до
+    отсутствующих таблиц.
+    """
+    source = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        with sqlite3.connect(target) as destination:
+            source.backup(destination)
+    finally:
+        source.close()
+    # Проверяем, что копией можно пользоваться.
+    check = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+    try:
+        if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError(f"копия {target} повреждена")
+        check.execute("SELECT COUNT(*) FROM orders").fetchone()
+    finally:
+        check.close()
 
 
 def main() -> None:
@@ -63,12 +115,14 @@ def main() -> None:
         print("\nэто предпросмотр; для выполнения добавь --confirm")
         return
 
-    backup = path.with_name(
-        f"{path.stem}.{datetime.now():%Y%m%d-%H%M%S}.bak{path.suffix}"
-    )
     conn.close()
-    shutil.copy2(path, backup)
-    print(f"\nкопия базы: {backup}")
+    was_running = stop_service()
+
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+    backup = ARCHIVE_DIR / f"agent.{stamp}.db"
+    backup_database(path, backup)
+    print(f"\nкопия базы: {backup} (проверена)")
 
     conn = sqlite3.connect(path)
     for table in WIPE:
@@ -83,7 +137,7 @@ def main() -> None:
     conn.close()
 
     if notes_files:
-        archive = WORKDIR / f"notes-archive-{datetime.now():%Y%m%d-%H%M%S}"
+        archive = ARCHIVE_DIR / f"notes-{stamp}"
         shutil.make_archive(str(archive), "gztar", root_dir=WORKDIR, base_dir="notes")
         print(f"архив заметок: {archive}.tar.gz")
         for item in notes_files:
@@ -91,7 +145,21 @@ def main() -> None:
         (WORKDIR / "notes" / "reports").mkdir(parents=True, exist_ok=True)
         print(f"заметки очищены: {len(notes_files)} файлов")
 
+    # Данные тоже относятся к прежней картине мира.
+    data_dir = Path(config.DATA_DIR)
+    if data_dir.exists():
+        removed = 0
+        for item in data_dir.iterdir():
+            if item.is_file():
+                item.unlink()
+                removed += 1
+        print(f"кеш котировок очищен: {removed} файлов")
+
     print("журнал очищен, thread_id сброшен — при запуске начнётся новая сессия")
+    if was_running:
+        start_service()
+    else:
+        print(f"запусти вручную: systemctl start {SERVICE}")
 
 
 if __name__ == "__main__":

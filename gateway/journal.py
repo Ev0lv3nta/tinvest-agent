@@ -100,7 +100,73 @@ CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Намерение отправить заявку. Пишется ДО обращения к брокеру: если ответ
+-- потерялся, а заявка принята, у нас остаётся ключ, по которому её можно
+-- найти, вместо второй заявки с новым ключом.
+CREATE TABLE IF NOT EXISTS order_intents (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            REAL    NOT NULL,
+    request_id    TEXT    NOT NULL UNIQUE,
+    instrument_id TEXT    NOT NULL,
+    ticker        TEXT,
+    direction     TEXT    NOT NULL,
+    order_type    TEXT    NOT NULL,
+    lots          INTEGER NOT NULL,
+    price         REAL,
+    card          TEXT,
+    state         TEXT    NOT NULL DEFAULT 'pending',
+    detail        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_intents_state ON order_intents(state, ts);
+
+-- Расход модели. Приходит отдельным событием app-server; до этой таблицы
+-- супервизор читал несуществующее поле и писал нули.
+CREATE TABLE IF NOT EXISTS usage (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL NOT NULL,
+    turn_id        TEXT,
+    input          INTEGER,
+    cached         INTEGER,
+    output         INTEGER,
+    reasoning      INTEGER,
+    total          INTEGER,
+    context_used   INTEGER,
+    context_window INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
+
+-- Условия пробуждения. За рынком следит код и будит агента по событию,
+-- вместо того чтобы агент просыпался по таймеру и всё перечитывал.
+CREATE TABLE IF NOT EXISTS watches (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts    REAL    NOT NULL,
+    instrument_id TEXT    NOT NULL,
+    ticker        TEXT,
+    kind          TEXT    NOT NULL,
+    threshold     REAL    NOT NULL,
+    note          TEXT    NOT NULL,
+    expires_ts    REAL,
+    fired_ts      REAL,
+    fired_value   REAL,
+    cancelled     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_watches_active ON watches(fired_ts, cancelled, expires_ts);
 """
+
+# Столбцы, добавленные после первой схемы. В SQLite нет ADD COLUMN IF NOT
+# EXISTS, поэтому пробуем и глотаем только «уже существует»: остальные
+# OperationalError (блокировка, повреждение) должны быть видны.
+MIGRATIONS = [
+    ("orders", "figi", "TEXT"),
+    ("orders", "request_id", "TEXT"),
+    ("orders", "requested_price", "REAL"),
+    ("orders", "card", "TEXT"),
+    ("orders", "closed_ts", "REAL"),
+    ("watches", "base_price", "REAL"),
+    ("watches", "url", "TEXT"),
+    ("watches", "content_hash", "TEXT"),
+]
 
 
 def connect() -> sqlite3.Connection:
@@ -113,11 +179,12 @@ def connect() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(SCHEMA)
-        # Столбец добавлен позже схемы; в SQLite нет ADD COLUMN IF NOT EXISTS.
-        try:
-            conn.execute("ALTER TABLE orders ADD COLUMN figi TEXT")
-        except sqlite3.OperationalError:
-            pass
+        for table, column, kind in MIGRATIONS:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
         conn.commit()
         _LOCAL.conn = conn
     return conn
@@ -159,12 +226,14 @@ def log_tool_call(
 def log_order(order: dict, rationale: str = "") -> None:
     conn = connect()
     conn.execute(
-        "INSERT INTO orders (ts, order_id, instrument_id, figi, ticker, direction, order_type,"
-        " lots, lots_executed, price, total, status, rationale, raw)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO orders (ts, order_id, request_id, instrument_id, figi, ticker,"
+        " direction, order_type, lots, lots_executed, price, requested_price, total,"
+        " status, rationale, card, raw)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             time.time(),
             order.get("order_id", ""),
+            order.get("request_id", ""),
             order.get("instrument_id", ""),
             order.get("figi"),
             order.get("ticker"),
@@ -173,9 +242,14 @@ def log_order(order: dict, rationale: str = "") -> None:
             int(order.get("lots") or 0),
             order.get("lots_executed"),
             order.get("price"),
+            # Неисполненная лимитка приходит с executedOrderPrice = 0, поэтому
+            # запрошенная цена хранится отдельно — иначе в журнале и в панели
+            # такая заявка выглядит сделкой по нулю.
+            order.get("requested_price"),
             order.get("total"),
             order.get("status"),
             rationale,
+            _dump(order.get("card")) if order.get("card") else None,
             _dump(order.get("raw")),
         ),
     )
@@ -201,19 +275,37 @@ def log_event(kind: str, payload: Any = None) -> None:
 
 
 def orders_last_hour() -> int:
+    """Попытки, а не только записанные ответы.
+
+    Считаются намерения: таймаут, отказ брокера и оборванный запрос — тоже
+    обращения к бирже, и от зацикливания защищать надо именно от них.
+    """
     conn = connect()
     row = conn.execute(
-        "SELECT COUNT(*) AS n FROM orders WHERE ts > ?", (time.time() - 3600,)
+        "SELECT COUNT(*) AS n FROM order_intents WHERE ts > ?", (time.time() - 3600,)
     ).fetchone()
     return int(row["n"])
 
 
+MAX_ACTIVE_WAKEUPS = 5
+
+
 def schedule_wakeup(due_ts: float, reason: str) -> int:
-    """Новый будильник отменяет прежние незакрытые: активный ровно один."""
+    """Будильников может быть несколько.
+
+    Раньше активным был ровно один, и новый отменял прежний. Из-за этого
+    независимые поводы («проверить позицию в 15:10» и «отчёт около 14:00»)
+    схлопывались в один ранний, а агент просыпался чаще, чем нужно.
+    """
     conn = connect()
-    conn.execute(
-        "UPDATE wakeups SET cancelled = 1 WHERE fired_ts IS NULL AND cancelled = 0"
-    )
+    active = conn.execute(
+        "SELECT COUNT(*) AS n FROM wakeups WHERE fired_ts IS NULL AND cancelled = 0"
+    ).fetchone()["n"]
+    if active >= MAX_ACTIVE_WAKEUPS:
+        raise ValueError(
+            f"уже {active} активных будильников при лимите {MAX_ACTIVE_WAKEUPS}; "
+            f"снимай ненужные через cancel_wakeup или следи ценой через watch"
+        )
     cursor = conn.execute(
         "INSERT INTO wakeups (created_ts, due_ts, reason) VALUES (?, ?, ?)",
         (time.time(), due_ts, reason),
@@ -222,12 +314,47 @@ def schedule_wakeup(due_ts: float, reason: str) -> int:
     return int(cursor.lastrowid)
 
 
+def cancel_wakeup(wakeup_id: int) -> bool:
+    conn = connect()
+    cursor = conn.execute(
+        "UPDATE wakeups SET cancelled = 1 WHERE id = ? AND fired_ts IS NULL"
+        " AND cancelled = 0",
+        (wakeup_id,),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def active_wakeups() -> list[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM wakeups WHERE fired_ts IS NULL AND cancelled = 0 ORDER BY due_ts"
+    ).fetchall()
+
+
 def pending_wakeup() -> Optional[sqlite3.Row]:
+    """Ближайший несработавший будильник."""
+    rows = active_wakeups()
+    return rows[0] if rows else None
+
+
+def due_wakeups(now: Optional[float] = None) -> list[sqlite3.Row]:
+    moment = time.time() if now is None else now
     conn = connect()
     return conn.execute(
         "SELECT * FROM wakeups WHERE fired_ts IS NULL AND cancelled = 0"
-        " ORDER BY due_ts LIMIT 1"
-    ).fetchone()
+        " AND due_ts <= ? ORDER BY due_ts",
+        (moment,),
+    ).fetchall()
+
+
+def postpone_wakeup(wakeup_id: int, seconds: float) -> None:
+    """Доставка не удалась — не гасим повод, а сдвигаем его."""
+    conn = connect()
+    conn.execute(
+        "UPDATE wakeups SET due_ts = ? WHERE id = ?", (time.time() + seconds, wakeup_id)
+    )
+    conn.commit()
 
 
 def mark_wakeup_fired(wakeup_id: int) -> None:
@@ -275,17 +402,24 @@ def enqueue_message(text: str, source: str = "operator") -> int:
     return int(cursor.lastrowid)
 
 
-def take_messages(limit: int = 10) -> list[sqlite3.Row]:
+def peek_messages(limit: int = 10) -> list[sqlite3.Row]:
+    """Недоставленные сообщения, БЕЗ пометки о доставке.
+
+    Пометка ставится отдельно и только после того, как агент событие принял.
+    Раньше строка помечалась доставленной при чтении, и сообщение оператора,
+    пришедшееся на обрыв канала, исчезало навсегда — в журнале первого
+    прогона такой случай есть.
+    """
     conn = connect()
-    rows = conn.execute(
+    return conn.execute(
         "SELECT * FROM messages WHERE delivered = 0 ORDER BY id LIMIT ?", (limit,)
     ).fetchall()
-    if rows:
-        conn.executemany(
-            "UPDATE messages SET delivered = 1 WHERE id = ?", [(r["id"],) for r in rows]
-        )
-        conn.commit()
-    return rows
+
+
+def mark_message_delivered(message_id: int) -> None:
+    conn = connect()
+    conn.execute("UPDATE messages SET delivered = 1 WHERE id = ?", (message_id,))
+    conn.commit()
 
 
 def kv_get(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -302,3 +436,315 @@ def kv_set(key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
+
+# --- день: опора для дневных лимитов --------------------------------------
+
+MSK_OFFSET = 3 * 3600
+
+
+def day_start_ts(now: Optional[float] = None) -> float:
+    """Полночь по Москве. Дневные лимиты считаются от неё, а не от суток UTC."""
+    moment = time.time() if now is None else now
+    return ((moment + MSK_OFFSET) // 86400) * 86400 - MSK_OFFSET
+
+
+def day_open_equity() -> Optional[float]:
+    """Стоимость портфеля на начало торгового дня.
+
+    Берётся первый срез после полуночи; если сегодня срезов ещё не было —
+    последний вчерашний. Если нет и его, дневной лимит не применяется:
+    лучше не ограничивать, чем ограничивать по выдуманному числу.
+    """
+    conn = connect()
+    start = day_start_ts()
+    row = conn.execute(
+        "SELECT total FROM snapshots WHERE ts >= ? ORDER BY ts LIMIT 1", (start,)
+    ).fetchone()
+    if row:
+        return float(row["total"])
+    row = conn.execute(
+        "SELECT total FROM snapshots WHERE ts < ? ORDER BY ts DESC LIMIT 1", (start,)
+    ).fetchone()
+    return float(row["total"]) if row else None
+
+
+def day_result(total: float) -> Optional[float]:
+    opening = day_open_equity()
+    return None if opening is None else total - opening
+
+
+def entries_today() -> int:
+    """Сколько раз сегодня открывали или наращивали позицию."""
+    conn = connect()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM orders WHERE ts >= ? AND direction = 'buy'"
+        " AND COALESCE(lots_executed, 0) > 0",
+        (day_start_ts(),),
+    ).fetchone()
+    return int(row["n"])
+
+
+def last_losing_exit(instrument_id: str) -> Optional[float]:
+    """Время последнего сегодняшнего выхода из бумаги в минус.
+
+    Сравнивается средневзвешенная цена сегодняшних покупок с ценой продажи:
+    точного посделочного матчинга здесь не нужно, нужен факт «вышел хуже,
+    чем заходил».
+    """
+    conn = connect()
+    start = day_start_ts()
+    buys = conn.execute(
+        "SELECT SUM(price * lots_executed) AS amount, SUM(lots_executed) AS lots"
+        " FROM orders WHERE ts >= ? AND instrument_id = ? AND direction = 'buy'"
+        " AND COALESCE(lots_executed, 0) > 0 AND COALESCE(price, 0) > 0",
+        (start, instrument_id),
+    ).fetchone()
+    if not buys or not buys["lots"]:
+        return None
+    average = float(buys["amount"]) / float(buys["lots"])
+    row = conn.execute(
+        "SELECT ts FROM orders WHERE ts >= ? AND instrument_id = ? AND direction = 'sell'"
+        " AND COALESCE(lots_executed, 0) > 0 AND COALESCE(price, 0) > 0 AND price < ?"
+        " ORDER BY ts DESC LIMIT 1",
+        (start, instrument_id, average),
+    ).fetchone()
+    return float(row["ts"]) if row else None
+
+
+# --- намерения по заявкам -------------------------------------------------
+
+
+def create_intent(intent: dict) -> None:
+    """Записать намерение до сети. Ключ идемпотентности — request_id."""
+    conn = connect()
+    conn.execute(
+        "INSERT INTO order_intents (ts, request_id, instrument_id, ticker, direction,"
+        " order_type, lots, price, card, state)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+        (
+            time.time(),
+            intent["request_id"],
+            intent["instrument_id"],
+            intent.get("ticker", ""),
+            intent["direction"],
+            intent["order_type"],
+            int(intent["lots"]),
+            intent.get("price"),
+            _dump(intent.get("card")) if intent.get("card") else None,
+        ),
+    )
+    conn.commit()
+
+
+def set_intent_state(request_id: str, state: str, detail: str = "") -> None:
+    conn = connect()
+    conn.execute(
+        "UPDATE order_intents SET state = ?, detail = ? WHERE request_id = ?",
+        (state, detail[:500] if detail else None, request_id),
+    )
+    conn.commit()
+
+
+# Состояния, при которых новую заявку по бумаге отправлять нельзя: либо мы
+# не знаем судьбу предыдущей, либо знаем, что она висит активной.
+BLOCKING_STATES = ("ambiguous", "live")
+
+
+def blocking_intents(instrument_id: str = "") -> list[sqlite3.Row]:
+    """Намерения, мешающие отправить новую заявку по этой бумаге."""
+    conn = connect()
+    marks = ",".join("?" * len(BLOCKING_STATES))
+    if instrument_id:
+        return conn.execute(
+            f"SELECT * FROM order_intents WHERE state IN ({marks})"
+            f" AND instrument_id = ? ORDER BY ts",
+            (*BLOCKING_STATES, instrument_id),
+        ).fetchall()
+    return conn.execute(
+        f"SELECT * FROM order_intents WHERE state IN ({marks}) ORDER BY ts",
+        BLOCKING_STATES,
+    ).fetchall()
+
+
+def intent_by_request(request_id: str) -> Optional[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM order_intents WHERE request_id = ?", (request_id,)
+    ).fetchone()
+
+
+def close_order(order_id: str, status: str) -> None:
+    """Пометить заявку закрытой, не трогая уже исполненный объём.
+
+    Частично исполненная лимитка после снятия остаётся частично исполненной:
+    обнулять lots_executed нельзя, иначе сделка исчезнет из статистики.
+    """
+    conn = connect()
+    conn.execute(
+        "UPDATE orders SET status = ?, closed_ts = ? WHERE order_id = ?",
+        (status, time.time(), order_id),
+    )
+    conn.commit()
+
+
+def update_order_status(order_id: str, status: str, lots_executed: int, price: float) -> None:
+    """Довести запись о заявке до фактического состояния.
+
+    Раньше сохранялся только первый ответ брокера: заявка, исполнившаяся
+    позже, навсегда оставалась NEW с нулём исполненных лотов, а отмена не
+    записывалась вовсе.
+    """
+    conn = connect()
+    conn.execute(
+        "UPDATE orders SET status = ?, lots_executed = ?,"
+        " price = CASE WHEN ? > 0 THEN ? ELSE price END,"
+        " closed_ts = CASE WHEN ? THEN ? ELSE closed_ts END"
+        " WHERE order_id = ?",
+        (
+            status,
+            lots_executed,
+            price,
+            price,
+            1 if status and ("FILL" in status or "CANCELLED" in status or "REJECTED" in status) else 0,
+            time.time(),
+            order_id,
+        ),
+    )
+    conn.commit()
+
+
+def open_orders() -> list[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM orders WHERE closed_ts IS NULL AND ts > ? ORDER BY ts",
+        (time.time() - 7 * 86400,),
+    ).fetchall()
+
+
+# --- расход модели --------------------------------------------------------
+
+
+def log_usage(turn_id: str, usage: dict) -> None:
+    conn = connect()
+    conn.execute(
+        "INSERT INTO usage (ts, turn_id, input, cached, output, reasoning, total,"
+        " context_used, context_window) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            time.time(),
+            turn_id,
+            usage.get("input"),
+            usage.get("cached"),
+            usage.get("output"),
+            usage.get("reasoning"),
+            usage.get("total"),
+            usage.get("context_used"),
+            usage.get("context_window"),
+        ),
+    )
+    conn.commit()
+
+
+def usage_since(seconds: float) -> dict:
+    conn = connect()
+    row = conn.execute(
+        "SELECT COUNT(*) AS turns, SUM(input) AS input, SUM(output) AS output,"
+        " SUM(total) AS total FROM usage WHERE ts > ?",
+        (time.time() - seconds,),
+    ).fetchone()
+    last = conn.execute(
+        "SELECT context_used, context_window FROM usage"
+        " WHERE context_used IS NOT NULL ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    return {
+        "turns": int(row["turns"] or 0),
+        "input": int(row["input"] or 0),
+        "output": int(row["output"] or 0),
+        "total": int(row["total"] or 0),
+        "context_used": int(last["context_used"]) if last and last["context_used"] else 0,
+        "context_window": int(last["context_window"]) if last and last["context_window"] else 0,
+    }
+
+
+# --- наблюдатели ----------------------------------------------------------
+
+MAX_ACTIVE_WATCHES = 20
+WATCH_KINDS = ("price_above", "price_below", "pct_move", "url_changed")
+
+
+def add_watch(
+    instrument_id: str,
+    ticker: str,
+    kind: str,
+    threshold: float,
+    note: str,
+    expires_ts: float,
+    base_price: Optional[float] = None,
+    url: str = "",
+    content_hash: str = "",
+) -> int:
+    if kind not in WATCH_KINDS:
+        raise ValueError(f"условие должно быть одним из {', '.join(WATCH_KINDS)}")
+    conn = connect()
+    active = conn.execute(
+        "SELECT COUNT(*) AS n FROM watches WHERE fired_ts IS NULL AND cancelled = 0"
+    ).fetchone()["n"]
+    if active >= MAX_ACTIVE_WATCHES:
+        raise ValueError(f"уже {active} наблюдателей при лимите {MAX_ACTIVE_WATCHES}")
+    cursor = conn.execute(
+        "INSERT INTO watches (created_ts, instrument_id, ticker, kind, threshold, note,"
+        " expires_ts, base_price, url, content_hash)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            time.time(), instrument_id, ticker, kind, float(threshold), note,
+            expires_ts, base_price, url, content_hash,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def active_watches() -> list[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM watches WHERE fired_ts IS NULL AND cancelled = 0"
+        " AND (expires_ts IS NULL OR expires_ts > ?) ORDER BY id",
+        (time.time(),),
+    ).fetchall()
+
+
+def cancel_watch(watch_id: int) -> bool:
+    conn = connect()
+    cursor = conn.execute(
+        "UPDATE watches SET cancelled = 1 WHERE id = ? AND fired_ts IS NULL"
+        " AND cancelled = 0",
+        (watch_id,),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def set_watch_hash(watch_id: int, content_hash: str) -> None:
+    conn = connect()
+    conn.execute("UPDATE watches SET content_hash = ? WHERE id = ?", (content_hash, watch_id))
+    conn.commit()
+
+
+def mark_watch_fired(watch_id: int, value: float) -> None:
+    conn = connect()
+    conn.execute(
+        "UPDATE watches SET fired_ts = ?, fired_value = ? WHERE id = ?",
+        (time.time(), value, watch_id),
+    )
+    conn.commit()
+
+
+def expire_watches() -> int:
+    conn = connect()
+    cursor = conn.execute(
+        "UPDATE watches SET cancelled = 1 WHERE fired_ts IS NULL AND cancelled = 0"
+        " AND expires_ts IS NOT NULL AND expires_ts <= ?",
+        (time.time(),),
+    )
+    conn.commit()
+    return cursor.rowcount

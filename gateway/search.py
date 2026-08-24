@@ -59,8 +59,23 @@ def web_search(query: str, model: str = "") -> dict:
                 if url and url not in sources:
                     sources.append(url)
 
+    # output_text — удобство SDK, а не гарантированное поле сырого ответа.
+    # Без фолбэка смена версии провайдера дала бы пустой текст при ok=true,
+    # то есть худший вид отказа: молчаливый.
+    text = data.get("output_text") or ""
+    if not text:
+        parts = []
+        for item in data.get("output", []):
+            for block in item.get("content") or []:
+                chunk = block.get("text")
+                if isinstance(chunk, str) and chunk:
+                    parts.append(chunk)
+        text = "\n".join(parts)
+    if not text:
+        raise SearchError("поиск вернул пустой ответ — текста нет ни в одном блоке")
+
     return {
-        "text": data.get("output_text", ""),
+        "text": text,
         "sources": sources,
         "tokens": (data.get("usage") or {}).get("input_tokens"),
     }

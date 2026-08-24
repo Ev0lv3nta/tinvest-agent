@@ -279,6 +279,29 @@ class SandboxClient:
             for item in raw.get("instruments", [])
         ][:limit]
 
+    def instrument_by_uid(self, uid: str) -> dict:
+        """Точное разрешение инструмента по идентификатору.
+
+        Раньше тикер и FIGI для журнала брались из текстового поиска, куда
+        передавался UID: обычно срабатывало, но кривая выдача записала бы в
+        журнал чужую бумагу, а сверка операций матчится по FIGI.
+        """
+        raw = self.call(
+            "InstrumentsService",
+            "GetInstrumentBy",
+            {"idType": "INSTRUMENT_ID_TYPE_UID", "id": uid},
+        )
+        item = raw.get("instrument") or {}
+        return {
+            "instrument_id": item.get("uid"),
+            "figi": item.get("figi"),
+            "ticker": item.get("ticker"),
+            "name": item.get("name"),
+            "lot": int(item.get("lot") or 1),
+            "currency": item.get("currency"),
+            "type": item.get("instrumentType"),
+        }
+
     def last_price(self, instrument_ids: list[str]) -> list[dict]:
         raw = self.call(
             "MarketDataService", "GetLastPrices", {"instrumentId": instrument_ids}

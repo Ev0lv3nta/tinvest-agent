@@ -22,6 +22,10 @@ class AppServerError(RuntimeError):
     pass
 
 
+class Busy(AppServerError):
+    """Ход идёт, а событие не настолько срочное, чтобы в него врезаться."""
+
+
 class AppServer:
     """Одна живая сессия Codex. Не потокобезопасен для параллельных запросов."""
 
@@ -41,10 +45,24 @@ class AppServer:
         self.thread_id: str = ""
         self.turn_id: str = ""
         self.busy: bool = False
+        # Момент последнего входящего события. Отдельно от времени доставки:
+        # иначе периодическая доставка «оживляет» зависший ход, и сторожок
+        # никогда не срабатывает.
+        self.last_inbound: float = time.time()
+        self.turn_started: float = 0.0
 
     # --- жизненный цикл ----------------------------------------------------
 
     def start(self) -> None:
+        try:
+            self._start()
+        except Exception:
+            # Половина запуска хуже, чем его отсутствие: дочерний процесс и
+            # потоки-читатели остались бы жить на мёртвом соединении.
+            self.stop()
+            raise
+
+    def _start(self) -> None:
         self.process = subprocess.Popen(
             self.command,
             cwd=self.cwd,
@@ -68,24 +86,47 @@ class AppServer:
         self.notify("initialized", {})
 
     def stop(self) -> None:
-        if self.process and self.process.poll() is None:
+        process, self.process = self.process, None
+        if process and process.poll() is None:
             try:
-                self.process.stdin.close()
+                process.stdin.close()
             except OSError:
                 pass
             try:
-                self.process.wait(timeout=10)
+                process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                process.kill()
+                process.wait(timeout=5)
+        elif process:
+            process.wait(timeout=5)
+        self._fail_pending("app-server остановлен")
+        for thread in (self._reader, self._stderr_reader):
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=2)
+        self._reader = self._stderr_reader = None
+        self.busy = False
+        self.turn_id = ""
 
     def alive(self) -> bool:
         return bool(self.process) and self.process.poll() is None
 
     # --- транспорт ---------------------------------------------------------
 
+    def _fail_pending(self, reason: str) -> None:
+        """Разбудить всех, кто ждёт ответа.
+
+        Без этого смерть процесса заставляла каждый висящий вызов ждать
+        полного таймаута вместо немедленной ошибки.
+        """
+        for request_id in list(self._pending):
+            waiter = self._pending.pop(request_id, None)
+            if waiter is not None:
+                waiter.put({"id": request_id, "error": {"message": reason}})
+
     def _read_loop(self) -> None:
-        assert self.process and self.process.stdout
-        for line in self.process.stdout:
+        process = self.process
+        assert process and process.stdout
+        for line in process.stdout:
             line = line.strip()
             if not line:
                 continue
@@ -94,13 +135,46 @@ class AppServer:
             except ValueError:
                 continue
 
+            self.last_inbound = time.time()
             if "id" in message and ("result" in message or "error" in message):
                 waiter = self._pending.pop(message["id"], None)
                 if waiter is not None:
                     waiter.put(message)
+            elif "id" in message and message.get("method"):
+                # Запрос от сервера: подтверждение, запрос ввода и подобное.
+                # Молчание подвесило бы ход — отвечаем явным отказом, чтобы
+                # агент увидел причину и продолжил сам.
+                self._decline(message)
             else:
                 self._track(message)
                 self.events.put(message)
+        self._fail_pending("app-server закрыл поток")
+
+    def _decline(self, message: dict) -> None:
+        method = message.get("method", "")
+        journal.log_event("appserver_request", {"method": method})
+        with self._lock:
+            if not self.alive():
+                return
+            self.process.stdin.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "error": {
+                            "code": -32601,
+                            "message": (
+                                f"метод {method} не поддерживается супервизором: "
+                                f"агент работает автономно, интерактивных "
+                                f"подтверждений нет"
+                            ),
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            self.process.stdin.flush()
 
     def _read_stderr(self) -> None:
         assert self.process and self.process.stderr
@@ -130,9 +204,11 @@ class AppServer:
         if method == "turn/started":
             self.turn_id = params.get("turnId") or (params.get("turn") or {}).get("id", "")
             self.busy = True
+            self.turn_started = time.time()
         elif method == "turn/completed":
             self.busy = False
             self.turn_id = ""
+            self.turn_started = 0.0
 
     def request(self, method: str, params: dict, timeout: int = 120) -> dict:
         if not self.alive():
@@ -212,10 +288,20 @@ class AppServer:
             journal.log_event("steer_failed", {"error": str(exc)[:300]})
             return False
 
-    def deliver(self, text: str) -> str:
-        """Отдать текст агенту: в текущий ход или новым ходом."""
-        if self.busy and self.steer(text):
-            return "steer"
+    def deliver(self, text: str, urgent: bool = False) -> str:
+        """Отдать текст агенту.
+
+        Врезаться в идущий ход можно только со срочным: сообщение оператора,
+        сработавший стоп, ошибка исполнения. Рутина ждёт своей очереди —
+        иначе будильник вливается в чужой ход и раздувает его. В разобранном
+        прогоне так и вышло: будильник 09:40 попал в ход по жалобе оператора,
+        и тот вырос до 144 вызовов инструментов и 17 поисков.
+        """
+        if self.busy:
+            if not urgent:
+                raise Busy("агент занят, рутинное событие подождёт")
+            if self.steer(text):
+                return "steer"
         self.start_turn(text)
         return "turn"
 

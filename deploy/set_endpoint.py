@@ -61,13 +61,29 @@ def main() -> None:
     print(f"обновлён {ENV_FILE}")
 
     config_text = CODEX_CONFIG.read_text()
-    CODEX_CONFIG.write_text(
-        re.sub(r'(?m)^base_url = ".*"$', f'base_url = "{url}"', config_text)
+    # Якорим на секцию провайдера: голый ^base_url бил бы по любой секции,
+    # если в конфиге появится второй провайдер.
+    updated, count = re.subn(
+        r'(?ms)(^\[model_providers\.omniroute\][^\[]*?^base_url = )"[^"]*"',
+        lambda m: f'{m.group(1)}"{url}"',
+        config_text,
     )
+    if count != 1:
+        raise SystemExit(
+            f"в {CODEX_CONFIG} не найдена ровно одна base_url в секции "
+            f"[model_providers.omniroute] (найдено {count}) — правь вручную"
+        )
+    CODEX_CONFIG.write_text(updated)
     print(f"обновлён {CODEX_CONFIG}")
 
-    subprocess.run(["systemctl", "restart", "tinvest-agent"], check=False)
-    print("супервизор перезапущен — агент подхватит новый адрес")
+    result = subprocess.run(["systemctl", "restart", "tinvest-agent"], check=False)
+    if result.returncode == 0:
+        print("супервизор перезапущен — агент подхватит новый адрес")
+    else:
+        print(
+            f"перезапуск не удался (код {result.returncode}); "
+            f"выполни вручную: systemctl restart tinvest-agent"
+        )
 
 
 if __name__ == "__main__":

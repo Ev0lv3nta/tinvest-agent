@@ -6,21 +6,41 @@ model_provider = "omniroute"
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 
+# Смысл стенда — видеть, КАК агент принимает решения. Без этого в ленту
+# попадают только заголовки шагов: за прошлый прогон 71 запись рассуждений
+# заняла 4,5 килобайта на всех, то есть по строчке на ход.
+model_reasoning_summary = "detailed"
+
 [model_providers.omniroute]
 name = "OmniRoute USA"
-base_url = "https://rendering-found-paid-listprice.trycloudflare.com/v1"
+# Прямой SSH-туннель на локальный порт. Cloudflare Quick Tunnel отваливался
+# по нескольку раз в сутки и больше не используется.
+base_url = "http://127.0.0.1:20128/v1"
 env_key = "OMNIROUTE_API_KEY"
 wire_api = "responses"
 
 # Инструменты шлюза. Без default_tools_approval_mode = "approve" вызовы
 # отклоняются: глобальный approval_policy = "never" означает «не спрашивать»,
 # а не «разрешить».
+#
+# required = true — чтобы тред не стартовал без торговых инструментов.
+# Иначе агент получает сессию, в которой не может ни посмотреть портфель,
+# ни закрыть позицию, и рассуждает о рынке словами.
 [mcp_servers.trading]
 command = "/usr/bin/python3"
 args = ["-m", "gateway.server"]
 cwd = "/opt/tinvest-agent"
 default_tools_approval_mode = "approve"
+required = true
+startup_timeout_sec = 30
+# Веб-поиск ходит до трёх минут; клиентский таймаут должен это переживать.
+tool_timeout_sec = 200
 
 [mcp_servers.trading.env]
 AGENT_DB = "/home/agent/state/agent.db"
+AGENT_DATA_DIR = "/home/agent/data"
+AGENT_WORKDIR = "/home/agent/work"
 PYTHONPATH = "/opt/tinvest-agent"
+
+[projects."/home/agent/work"]
+trust_level = "trusted"

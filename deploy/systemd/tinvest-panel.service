@@ -9,6 +9,7 @@ Group=agent
 WorkingDirectory=/opt/tinvest-agent
 Environment=PYTHONPATH=/opt/tinvest-agent
 Environment=PYTHONUNBUFFERED=1
+Environment=AGENT_DATA_DIR=/home/agent/data
 Environment=AGENT_DB=/home/agent/state/agent.db
 ExecStart=/usr/bin/python3 -m webapp.server
 Restart=always

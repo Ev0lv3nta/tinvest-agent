@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import time
 import urllib.error
@@ -56,6 +57,35 @@ def _ago(ts: float) -> str:
     return f"{int(minutes // 1440)} дн назад"
 
 
+def _status(row) -> str:
+    """Понятный статус вместо кода API.
+
+    Неисполненная лимитка приходит с executedOrderPrice = 0 и статусом NEW —
+    в ленте она выглядела сделкой по нулевой цене.
+    """
+    status = str(row["status"] or "")
+    executed = row["lots_executed"] or 0
+    if "FILL" in status and executed >= (row["lots"] or 0):
+        return "исполнена"
+    if executed:
+        return f"исполнена частично ({executed} из {row['lots']})"
+    if "CANCELLED" in status:
+        return "снята"
+    if "REJECTED" in status:
+        return "отклонена"
+    return "выставлена"
+
+
+def _esc(value) -> str:
+    """Экранирование для parse_mode=HTML.
+
+    Обоснования сделок и тексты ошибок пишет модель, и любой `<` или `&`
+    в них превращал ответ Telegram в 400: сообщение просто не приходило,
+    молча. Для алерта «сделки мимо шлюза» это единственный канал.
+    """
+    return html.escape(str(value), quote=False)
+
+
 class Bot:
     def __init__(self, on_message: Optional[Callable[[str], None]] = None):
         self.token = config.secret("TELEGRAM_BOT_TOKEN")
@@ -67,7 +97,7 @@ class Bot:
 
     def _api(self, method: str, payload: dict, timeout: int = 30) -> dict:
         if not self.token:
-            return {"ok": False}
+            return {"ok": False, "error": "нет токена"}
         request = urllib.request.Request(
             API.format(token=self.token, method=method),
             data=json.dumps(payload).encode(),
@@ -76,9 +106,19 @@ class Bot:
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read())
-        except (urllib.error.URLError, OSError, ValueError):
-            return {"ok": False}
+                answer = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:300].decode("utf-8", "replace")
+            journal.log_event("telegram_error", {"method": method, "detail": detail})
+            return {"ok": False, "error": detail}
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)[:200]}
+        if not answer.get("ok"):
+            journal.log_event(
+                "telegram_error",
+                {"method": method, "detail": str(answer.get("description"))[:300]},
+            )
+        return answer
 
     def send(self, text: str, keyboard: bool = True) -> bool:
         payload = {
@@ -89,6 +129,11 @@ class Bot:
         }
         if keyboard:
             payload["reply_markup"] = KEYBOARD
+        answer = self._api("sendMessage", payload)
+        if answer.get("ok"):
+            return True
+        # Разметка могла не понравиться — сообщение важнее оформления.
+        payload.pop("parse_mode", None)
         return self._api("sendMessage", payload).get("ok", False)
 
     def set_commands(self) -> None:
@@ -124,7 +169,7 @@ class Bot:
             lines.append("")
             for position in positions:
                 lines.append(
-                    f"{position.get('ticker') or '?'} — {position.get('lots', 0):g} лот, "
+                    f"{_esc(position.get('ticker') or '?')} — {position.get('lots', 0):g} лот, "
                     f"{_money(position.get('current_price', 0) * position.get('quantity', 0))} ₽ "
                     f"({position.get('yield', 0):+.0f} ₽)"
                 )
@@ -141,7 +186,11 @@ class Bot:
         current = rows[-1]["total"]
         peak = max(r["total"] for r in rows)
         drawdown = (current / peak - 1) * 100 if peak else 0.0
-        trades = conn.execute("SELECT COUNT(*) AS n FROM orders").fetchone()["n"]
+        # Сделка — исполненная заявка. Отменённые лимитки сделками не были.
+        trades = conn.execute(
+            "SELECT COUNT(*) AS n FROM orders WHERE COALESCE(lots_executed,0) > 0"
+        ).fetchone()["n"]
+        submitted = conn.execute("SELECT COUNT(*) AS n FROM orders").fetchone()["n"]
         halted = journal.kv_get("halted", "")
         lines = [
             "<b>Итог</b>",
@@ -149,10 +198,10 @@ class Bot:
             f"К старту: {current - start:+,.0f} ₽ ({(current / start - 1) * 100:+.2f}%)".replace(",", " "),
             f"Максимум: {_money(peak)} ₽, просадка от него {drawdown:.2f}%",
             f"Порог остановки: {_money(config.CAPITAL_FLOOR)} ₽",
-            f"Сделок: {trades}",
+            f"Сделок: {trades}" + (f" (заявок {submitted})" if submitted > trades else ""),
         ]
         if halted:
-            lines.append(f"\n⛔ <b>Остановлен:</b> {halted}")
+            lines.append(f"\n⛔ <b>Остановлен:</b> {_esc(halted)}")
         return "\n".join(lines)
 
     def render_trades(self, limit: int = 8) -> str:
@@ -167,18 +216,19 @@ class Bot:
             when = datetime.fromtimestamp(row["ts"], MSK).strftime("%d.%m %H:%M")
             side = "покупка" if row["direction"] == "buy" else "продажа"
             lines.append(
-                f"\n<b>{when}</b> · {side} {row['ticker'] or '?'} × {row['lots']} лот"
-                f"\n{_money(row['total'] or 0)} ₽ · {row['status'] or '?'}"
+                f"\n<b>{when}</b> · {side} {_esc(row['ticker'] or '?')} × {row['lots']} лот"
+                f"\n{_money(row['total'] or row['requested_price'] and row['requested_price'] * row['lots'] or 0)} ₽"
+                f" · {_esc(_status(row))}"
             )
             if row["rationale"]:
-                lines.append(f"<i>{row['rationale'][:300]}</i>")
+                lines.append(f"<i>{_esc(row['rationale'][:300])}</i>")
         return "\n".join(lines)
 
     def render_limits(self, force: bool = False) -> str:
         try:
             data = limits.fetch(force=force)
         except limits.LimitsError as exc:
-            return f"Не удалось получить квоты: {exc}"
+            return f"Не удалось получить квоты: {_esc(str(exc))}"
         if not data["accounts"]:
             return "Аккаунтов не найдено."
 
@@ -188,7 +238,7 @@ class Bot:
             filled = round(account["percent"] / 10)
             bar = "█" * filled + "░" * (10 - filled)
             lines.append(
-                f"\n<code>{account['id']}</code> · {account['plan']}"
+                f"\n<code>{_esc(account['id'])}</code> · {_esc(account['plan'])}"
                 f"\n{bar} <b>{account['percent']:.0f}%</b>"
                 f"\n{account['used']} из {account['total']} · осталось {account['remaining']}"
             )
@@ -218,7 +268,7 @@ class Bot:
         ).fetchone()
         if last_call:
             when = datetime.fromtimestamp(last_call["ts"], MSK).strftime("%d.%m %H:%M:%S")
-            lines.append(f"Последнее действие: <b>{last_call['tool']}</b>")
+            lines.append(f"Последнее действие: <b>{_esc(last_call['tool'])}</b>")
             lines.append(f"{when} ({_ago(last_call['ts'])})")
 
         last_end = journal.kv_get("last_turn_end", "")
@@ -238,7 +288,19 @@ class Bot:
             minutes = (pending["due_ts"] - time.time()) / 60
             through = f"{minutes:.0f} мин" if minutes < 120 else f"{minutes / 60:.1f} ч"
             lines.append(f"⏰ Следующее пробуждение: <b>{when}</b> (через {through})")
-            lines.append(f"<i>{pending['reason'][:400]}</i>")
+            lines.append(f"<i>{_esc(pending['reason'][:400])}</i>")
+
+        watches = journal.active_watches()
+        if watches:
+            lines.append("\n👁 <b>Следит код</b>")
+            sign = {"price_above": "≥", "price_below": "≤", "pct_move": "движение"}
+            for row in watches[:6]:
+                what = row["ticker"] or (row["url"] or "")[:40]
+                lines.append(
+                    f"{_esc(what)} {sign.get(row['kind'], row['kind'])} "
+                    f"{row['threshold']:g}" if row["kind"] != "url_changed"
+                    else f"страница {_esc(what)}"
+                )
         else:
             lines.append("⏰ Будильник не назначен — разбужу сам по расписанию.")
 
@@ -267,7 +329,7 @@ class Bot:
             return "Отчётов пока не было. Первый придёт после закрытия торгов."
         payload = json.loads(row["payload"] or "{}")
         when = datetime.fromtimestamp(row["ts"], MSK).strftime("%d.%m %H:%M")
-        return f"<b>Отчёт от {when}</b>\n\n{payload.get('summary', '')}"
+        return f"<b>Отчёт от {when}</b>\n\n{_esc(payload.get('summary', ''))}"
 
     # --- обработка входящих ------------------------------------------------
 
@@ -306,7 +368,7 @@ class Bot:
             self.send("▶️ Остановка снята, агент снова может торговать.")
         elif self.on_message:
             self.on_message(text)
-            self.send("Передал агенту.", keyboard=False)
+            self.send("Поставил в очередь агенту.", keyboard=False)
 
     def poll(self, timeout: int = 25) -> int:
         """Один цикл long-polling. Возвращает число обработанных сообщений."""
