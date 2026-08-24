@@ -132,6 +132,7 @@ def _order(direction: str, instrument_id: str, lots: int, price, rationale: str)
     limits = api.max_lots(instrument_id, price)
     info = api.find_instrument(instrument_id, limit=1)
     ticker = info[0]["ticker"] if info else instrument_id[:8]
+    figi = info[0]["figi"] if info else ""
 
     if direction == "ORDER_DIRECTION_BUY":
         guards.check_buy(lots, limits, ticker)
@@ -143,6 +144,7 @@ def _order(direction: str, instrument_id: str, lots: int, price, rationale: str)
         {
             "order_id": result["order_id"],
             "instrument_id": instrument_id,
+            "figi": figi,
             "ticker": ticker,
             "direction": "buy" if direction.endswith("BUY") else "sell",
             "order_type": "limit" if price is not None else "market",

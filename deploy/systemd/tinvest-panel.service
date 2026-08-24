@@ -1,0 +1,18 @@
+[Unit]
+Description=Панель наблюдения за торговым агентом
+After=network-online.target
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+WorkingDirectory=/opt/tinvest-agent
+Environment=PYTHONPATH=/opt/tinvest-agent
+Environment=PYTHONUNBUFFERED=1
+Environment=AGENT_DB=/home/agent/state/agent.db
+ExecStart=/usr/bin/python3 -m webapp.server
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

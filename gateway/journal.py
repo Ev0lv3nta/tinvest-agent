@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS orders (
     ts            REAL    NOT NULL,
     order_id      TEXT    NOT NULL,
     instrument_id TEXT    NOT NULL,
+    figi          TEXT,
     ticker        TEXT,
     direction     TEXT    NOT NULL,
     order_type    TEXT    NOT NULL,
@@ -73,6 +74,19 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 
+CREATE TABLE IF NOT EXISTS transcript (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         REAL    NOT NULL,
+    thread_id  TEXT    NOT NULL DEFAULT '',
+    turn_id    TEXT    NOT NULL DEFAULT '',
+    is_own     INTEGER NOT NULL DEFAULT 1,
+    kind       TEXT    NOT NULL,
+    title      TEXT,
+    body       TEXT,
+    payload    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_transcript_ts ON transcript(id);
+
 CREATE TABLE IF NOT EXISTS messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     ts         REAL    NOT NULL,
@@ -99,6 +113,11 @@ def connect() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(SCHEMA)
+        # Столбец добавлен позже схемы; в SQLite нет ADD COLUMN IF NOT EXISTS.
+        try:
+            conn.execute("ALTER TABLE orders ADD COLUMN figi TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         _LOCAL.conn = conn
     return conn
@@ -140,13 +159,14 @@ def log_tool_call(
 def log_order(order: dict, rationale: str = "") -> None:
     conn = connect()
     conn.execute(
-        "INSERT INTO orders (ts, order_id, instrument_id, ticker, direction, order_type,"
+        "INSERT INTO orders (ts, order_id, instrument_id, figi, ticker, direction, order_type,"
         " lots, lots_executed, price, total, status, rationale, raw)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             time.time(),
             order.get("order_id", ""),
             order.get("instrument_id", ""),
+            order.get("figi"),
             order.get("ticker"),
             order.get("direction", ""),
             order.get("order_type", ""),
@@ -213,6 +233,34 @@ def pending_wakeup() -> Optional[sqlite3.Row]:
 def mark_wakeup_fired(wakeup_id: int) -> None:
     conn = connect()
     conn.execute("UPDATE wakeups SET fired_ts = ? WHERE id = ?", (time.time(), wakeup_id))
+    conn.commit()
+
+
+def log_transcript(
+    kind: str,
+    title: str = "",
+    body: str = "",
+    payload: Any = None,
+    thread_id: str = "",
+    turn_id: str = "",
+    is_own: bool = True,
+) -> None:
+    """Лента сессии для чтения человеком: всё, что происходило по порядку."""
+    conn = connect()
+    conn.execute(
+        "INSERT INTO transcript (ts, thread_id, turn_id, is_own, kind, title, body, payload)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            time.time(),
+            thread_id,
+            turn_id,
+            1 if is_own else 0,
+            kind,
+            title[:400] if title else None,
+            body[:20000] if body else None,
+            _dump(payload, 8000) if payload is not None else None,
+        ),
+    )
     conn.commit()
 
 

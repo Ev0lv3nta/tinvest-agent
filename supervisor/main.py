@@ -21,6 +21,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from gateway import config, journal
+from supervisor import reconcile
 from supervisor.appserver import AppServer, AppServerError
 from supervisor.telegram import Bot
 
@@ -37,8 +38,24 @@ CHECK_INTERVAL_CLOSED = 4 * 60 * 60
 # Если агент не подал признаков жизни столько времени — будим принудительно.
 DEADMAN_TIMEOUT = 3 * 60 * 60
 
+# Сверка операций с журналом: во время торгов чаще, вне — реже.
+RECONCILE_INTERVAL_MARKET = 8 * 60
+RECONCILE_INTERVAL_CLOSED = 60 * 60
+
 DAILY_REPORT_HOUR = 18
 DAILY_REPORT_MINUTE = 45
+
+# Как называется занятие агента для панели наблюдения.
+ACTIVITY = {
+    "reasoning": "думает",
+    "mcpToolCall": "инструмент",
+    "commandExecution": "команда",
+    "webSearch": "ищет",
+    "collabToolCall": "субагенты",
+    "fileChange": "правит файлы",
+    "agentMessage": "отвечает",
+}
+
 
 MARKET_OPEN = (10, 0)
 MARKET_CLOSE = (23, 50)
@@ -84,6 +101,7 @@ class Supervisor:
         self.last_activity = time.time()
         self.last_check = 0.0
         self.last_report_date = journal.kv_get("last_report_date", "")
+        self.last_reconcile = 0.0
 
     # --- запуск ------------------------------------------------------------
 
@@ -128,7 +146,10 @@ class Supervisor:
         try:
             mode = self.codex.deliver(text)
             journal.log_event("wake", {"kind": kind, "mode": mode, "text": text[:400]})
+            journal.log_transcript("wake", title=kind, body=text)
             journal.kv_set("agent_state", "работает")
+            journal.kv_set("live_text", "")
+            journal.kv_set("live_activity", "думает")
             self.last_activity = time.time()
         except AppServerError as exc:
             journal.log_event("wake_failed", {"kind": kind, "error": str(exc)[:300]})
@@ -199,36 +220,152 @@ class Supervisor:
         journal.kv_set("last_report_date", today)
         self.deliver(self.wake_text("report"), "report")
 
+    # Как элемент ленты выглядит для читателя: заголовок и тело.
+    # Полная нагрузка всё равно сохраняется отдельно.
+    @staticmethod
+    def _describe(item: dict) -> tuple[str, str, str]:
+        kind = item.get("type") or "unknown"
+
+        def first(*keys, default=""):
+            for key in keys:
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+                if isinstance(value, list) and value:
+                    parts = [
+                        p.get("text", "") if isinstance(p, dict) else str(p) for p in value
+                    ]
+                    joined = "\n".join(x for x in parts if x)
+                    if joined.strip():
+                        return joined
+            return default
+
+        if kind in ("agentMessage", "userMessage"):
+            return kind, "", first("text", "content")
+        if kind == "reasoning":
+            return kind, "", first("text", "summary", "content")
+        if kind == "commandExecution":
+            command = first("command", "commandLine")
+            output = first("aggregatedOutput", "output", "stdout")
+            return kind, command[:400], output
+        if kind == "mcpToolCall":
+            tool = item.get("tool") or item.get("name") or ""
+            server = item.get("server") or ""
+            title = f"{server}.{tool}" if server else str(tool)
+
+            # Результат приходит конвертом MCP: {"content": [{"type": "text", ...}]}.
+            # Для чтения нужен сам текст, а не структура вокруг него.
+            result = item.get("result")
+            text = ""
+            if isinstance(result, dict):
+                for block in result.get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text += block.get("text", "")
+            elif result is not None:
+                text = str(result)
+
+            arguments = item.get("arguments") or {}
+            head = json.dumps(arguments, ensure_ascii=False) if arguments else ""
+            body = f"{head}\n\n{text}".strip() if head else text
+            return kind, title, body
+        if kind == "webSearch":
+            action = item.get("action") or {}
+            query = item.get("query") or ""
+            if not query and isinstance(action, dict):
+                queries = action.get("queries")
+                query = ", ".join(queries) if queries else action.get("url", "")
+            return kind, str(query)[:400], ""
+        if kind == "collabToolCall":
+            return kind, str(item.get("tool") or ""), first("prompt")
+        if kind == "fileChange":
+            changes = item.get("changes") or []
+            names = [c.get("path", "") for c in changes] if isinstance(changes, list) else []
+            return kind, ", ".join(n for n in names if n)[:400], ""
+        if kind == "error":
+            return kind, "", first("message", "text")
+        return kind, "", first("text", "message")
+
+    _seen_methods: set = set()
+
+    def tick_reconcile(self) -> None:
+        interval = RECONCILE_INTERVAL_MARKET if market_open() else RECONCILE_INTERVAL_CLOSED
+        if time.time() - self.last_reconcile < interval:
+            return
+        self.last_reconcile = time.time()
+        found = reconcile.check_and_alert(lambda text: self.bot.send(text))
+        if found:
+            journal.log_event("reconcile_alerted", {"count": found})
+
     def tick_events(self) -> None:
         for event in self.codex.drain_events():
+            # Незнакомое событие логируем один раз: так видно, что поток
+            # отдаёт на самом деле, без шума на каждом кадре.
+            method_name = event.get("method") or ""
+            if method_name not in self._seen_methods:
+                self._seen_methods.add(method_name)
+                journal.log_event(
+                    "method_seen",
+                    {"method": method_name, "keys": sorted((event.get("params") or {}).keys())},
+                )
             method = event.get("method")
             params = event.get("params") or {}
-
             thread_id = params.get("threadId") or ""
             own = not thread_id or thread_id == self.codex.thread_id
 
             if method == "turn/completed" and own:
                 journal.kv_set("agent_state", "спит")
+                journal.kv_set("live_text", "")
+                journal.kv_set("live_activity", "")
                 journal.kv_set("last_turn_end", str(time.time()))
                 self.last_activity = time.time()
                 journal.log_event("turn_completed", {"usage": params.get("usage") or {}})
+                journal.log_transcript(
+                    "turnEnd", payload=params.get("usage") or {}, thread_id=thread_id, is_own=own
+                )
+            elif method == "turn/started":
+                journal.log_transcript("turnStart", thread_id=thread_id, is_own=own)
+            elif method == "item/agentMessage/delta" and own:
+                # Поток ответа: копим текст, панель показывает его по мере
+                # появления. Без этого пауза в минуту выглядит как зависание.
+                chunk = params.get("delta") or params.get("text") or ""
+                if chunk:
+                    journal.kv_set(
+                        "live_text", (journal.kv_get("live_text", "") or "") + chunk
+                    )
+                    journal.kv_set("live_activity", "")
+            elif method == "item/started" and own:
+                item = params.get("item") or {}
+                kind, title, _ = self._describe(item)
+                label = ACTIVITY.get(kind)
+                # userMessage и прочая служебная мелочь — не занятие агента.
+                if label:
+                    journal.kv_set(
+                        "live_activity", label + (f": {title[:80]}" if title else "")
+                    )
             elif method == "item/completed":
                 item = params.get("item") or {}
-                # app-server отдаёт типы в camelCase: agentMessage, userMessage.
-                kind = item.get("type")
+                kind, title, body = self._describe(item)
+                journal.log_transcript(
+                    kind,
+                    title=title,
+                    body=body,
+                    payload=item,
+                    thread_id=thread_id,
+                    turn_id=params.get("turnId") or "",
+                    is_own=own,
+                )
                 if kind == "agentMessage":
-                    text = (item.get("text") or "")[:4000]
                     journal.log_event(
-                        "agent_message" if own else "subagent_message", {"text": text}
+                        "agent_message" if own else "subagent_message",
+                        {"text": body[:4000]},
                     )
                     self.last_activity = time.time()
                 elif kind == "error":
-                    journal.log_event("item_error", {"message": str(item.get("message"))[:500]})
+                    journal.log_event("item_error", {"message": body[:500]})
             elif method == "error":
-                # Ошибки хода приходят нотификацией, а не в stderr: без этого
-                # ход молча завершается пустым и причина не видна нигде.
                 detail = (params.get("error") or {}).get("message", str(params))
                 journal.log_event("turn_error", {"error": str(detail)[:500]})
+                journal.log_transcript("error", body=str(detail)[:2000], thread_id=thread_id)
                 self.bot.send(f"⚠️ Ошибка хода агента:\n{str(detail)[:500]}", keyboard=False)
 
     def tick_inbox(self) -> None:
@@ -273,6 +410,7 @@ class Supervisor:
 
                 self.tick_events()
                 self.tick_inbox()
+                self.tick_reconcile()
                 if not self.tick_halt():
                     self.tick_wakeup()
                     self.tick_report()

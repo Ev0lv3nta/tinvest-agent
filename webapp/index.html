@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Торговый агент</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:#100f0e; --surface:#171614; --raise:#1e1c19; --line:#2b2724;
+  --text:#e7e1d8; --muted:#948a7b; --faint:#6d655a;
+  --accent:#c8a15a; --pos:#829d6c; --neg:#c2725a;
+  --radius:10px;
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+  font-family:var(--font);font-size:15px;line-height:1.6;
+  -webkit-font-smoothing:antialiased}
+body{padding-bottom:env(safe-area-inset-bottom)}
+
+/* ── шапка ─────────────────────────────────────────────── */
+header{position:sticky;top:0;z-index:20;background:rgba(16,15,14,.96);
+  backdrop-filter:blur(12px);border-bottom:1px solid var(--line);
+  padding:10px 18px 0;transition:padding .18s ease}
+.sum{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.total{font-size:22px;font-weight:600;letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums;transition:font-size .18s ease}
+.delta{font-size:14px;font-weight:500;font-variant-numeric:tabular-nums}
+.pos{color:var(--pos)} .neg{color:var(--neg)} .flat{color:var(--muted)}
+.meta{display:flex;align-items:center;gap:7px;margin-top:3px;
+  font-size:12px;color:var(--muted);flex-wrap:wrap;
+  max-height:20px;overflow:hidden;transition:max-height .18s ease,margin .18s ease,opacity .15s}
+
+/* Сжатая шапка: при прокрутке вниз и когда открыта клавиатура.
+   На телефоне вертикаль дороже красоты. */
+header.slim{padding-top:6px}
+header.slim .total{font-size:15px}
+header.slim .delta{font-size:12.5px}
+header.slim .meta{max-height:0;margin-top:0;opacity:0}
+header.slim nav button{padding:6px 0 7px;font-size:12.5px}
+header.slim .sum{gap:8px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--faint);flex:none}
+#dot2{align-self:center}
+.dot.live{background:var(--pos);box-shadow:0 0 0 3px rgba(130,157,108,.16)}
+.sep{color:var(--line)}
+.halt{margin:10px 0 0;padding:9px 12px;border-radius:var(--radius);
+  background:rgba(194,114,90,.12);border:1px solid rgba(194,114,90,.3);
+  color:var(--neg);font-size:13px}
+nav{display:flex;gap:2px;margin-top:9px;transition:margin .18s ease}
+nav button{flex:1;background:none;border:none;color:var(--faint);
+  font:inherit;font-size:13.5px;padding:8px 0 9px;cursor:pointer;
+  transition:padding .18s ease,font-size .18s ease;
+  border-bottom:2px solid transparent;transition:color .15s}
+nav button.on{color:var(--text);border-bottom-color:var(--accent)}
+
+/* ── лента ─────────────────────────────────────────────── */
+main{padding:6px 18px 40px;max-width:760px;margin:0 auto}
+.older{width:100%;margin:14px 0;padding:9px;background:none;
+  border:1px solid var(--line);border-radius:var(--radius);
+  color:var(--muted);font:inherit;font-size:13px;cursor:pointer}
+.older:active{background:var(--surface)}
+
+.ev{margin:2px 0}
+.time{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+
+/* пробуждение — разделитель дня */
+.wake{margin:26px 0 18px;padding-top:16px;border-top:1px solid var(--line)}
+.wake .lbl{display:flex;align-items:center;gap:7px;font-size:12px;
+  color:var(--accent);letter-spacing:.04em;text-transform:uppercase}
+.wake .txt{margin-top:6px;font-size:13.5px;color:var(--muted)}
+
+/* реплика агента — основной текст */
+.say{margin:16px 0;white-space:pre-wrap;word-break:break-word}
+.say .time{display:block;margin-bottom:5px}
+
+/* сообщение оператора */
+.op{margin:16px 0;padding:11px 14px;background:var(--raise);
+  border-radius:var(--radius);border-left:2px solid var(--accent)}
+.op .who{font-size:11px;color:var(--accent);text-transform:uppercase;
+  letter-spacing:.04em;margin-bottom:4px}
+.op .txt{white-space:pre-wrap;font-size:14px;color:var(--text)}
+
+/* строка действия: инструмент, команда, поиск */
+.act{display:flex;align-items:flex-start;gap:9px;padding:6px 0;
+  font-size:13.5px;color:var(--muted);cursor:pointer}
+.act:hover .name{color:var(--text)}
+.act .ic{flex:none;width:15px;text-align:center;color:var(--faint);font-size:11px;margin-top:3px}
+.act .name{font-family:var(--mono);font-size:12.5px;color:var(--muted);
+  word-break:break-all;transition:color .15s}
+.act .hint{color:var(--faint);font-size:12.5px;margin-left:auto;flex:none;padding-left:8px}
+.out{margin:2px 0 10px 24px;padding:10px 12px;background:var(--surface);
+  border-radius:8px;font-family:var(--mono);font-size:12px;line-height:1.55;
+  color:var(--muted);white-space:pre-wrap;word-break:break-word;
+  max-height:340px;overflow:auto}
+.out.hide{display:none}
+
+/* размышления */
+.think{margin:4px 0;font-size:13px;color:var(--faint);font-style:italic;
+  cursor:pointer;padding:3px 0}
+.think:hover{color:var(--muted)}
+
+/* субагент */
+.sub{border-left:2px solid var(--line);padding-left:13px;margin-left:2px}
+
+.err{margin:12px 0;padding:11px 13px;border-radius:var(--radius);
+  background:rgba(194,114,90,.1);border:1px solid rgba(194,114,90,.28);
+  color:var(--neg);font-size:13.5px;white-space:pre-wrap}
+
+/* ── сделки ────────────────────────────────────────────── */
+.trade{padding:15px 0;border-bottom:1px solid var(--line)}
+.trade .top{display:flex;align-items:baseline;gap:9px}
+.trade .tk{font-weight:600;font-size:16px}
+.trade .side{font-size:12px;padding:2px 7px;border-radius:5px}
+.side.buy{background:rgba(130,157,108,.16);color:var(--pos)}
+.side.sell{background:rgba(194,114,90,.16);color:var(--neg)}
+.trade .amt{margin-left:auto;font-variant-numeric:tabular-nums;font-size:14px}
+.trade .why{margin-top:7px;font-size:13.5px;color:var(--muted)}
+
+/* ── итог ──────────────────────────────────────────────── */
+.rows{margin-top:6px}
+.row{display:flex;justify-content:space-between;padding:11px 0;
+  border-bottom:1px solid var(--line);font-size:14px}
+.row span:first-child{color:var(--muted)}
+.row span:last-child{font-variant-numeric:tabular-nums}
+.chart{margin:18px 0 8px;height:130px;width:100%}
+.chart path{fill:none;stroke:var(--accent);stroke-width:1.5;
+  stroke-linejoin:round;stroke-linecap:round}
+.chart .area{fill:rgba(200,161,90,.09);stroke:none}
+.chart .base{stroke:var(--line);stroke-width:1;stroke-dasharray:3 4}
+
+.empty{text-align:center;color:var(--faint);padding:56px 20px;font-size:14px}
+.pos-item{display:flex;justify-content:space-between;padding:9px 0;
+  border-bottom:1px solid var(--line);font-size:14px}
+.pos-item .q{color:var(--muted);font-size:13px}
+
+/* ── живой ответ ───────────────────────────────────────── */
+.live{margin:16px 0 8px}
+.live .doing{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--accent)}
+.live .doing b{font-weight:500}
+.live .doing .q{color:var(--muted);font-weight:400}
+.pulse{width:6px;height:6px;border-radius:50%;background:var(--accent);
+  animation:pulse 1.4s ease-in-out infinite;flex:none}
+@keyframes pulse{0%,100%{opacity:.25;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}
+.live .streamed{margin-top:9px;white-space:pre-wrap;word-break:break-word}
+.live .streamed::after{content:'▌';color:var(--accent);animation:blink 1.1s steps(2) infinite}
+@keyframes blink{0%,50%{opacity:1}51%,100%{opacity:0}}
+
+/* ── поле ввода ────────────────────────────────────────── */
+.composer{position:sticky;bottom:0;background:linear-gradient(transparent,var(--bg) 22%);
+  padding:20px 0 max(14px,env(safe-area-inset-bottom));margin-top:8px}
+.cbox{display:flex;gap:8px;align-items:flex-end;background:var(--raise);
+  border:1px solid var(--line);border-radius:14px;padding:8px 8px 8px 14px;
+  transition:border-color .15s}
+.cbox:focus-within{border-color:#3a352f}
+.cbox textarea{flex:1;background:none;border:none;outline:none;resize:none;
+  color:var(--text);font:inherit;font-size:15px;line-height:1.5;
+  max-height:150px;padding:5px 0}
+.cbox textarea::placeholder{color:var(--faint)}
+.cbox button{flex:none;width:33px;height:33px;border:none;border-radius:9px;
+  background:var(--accent);color:#100f0e;font-size:16px;cursor:pointer;
+  display:grid;place-items:center;transition:opacity .15s}
+.cbox button:disabled{opacity:.28;cursor:default}
+.note{font-size:12px;color:var(--faint);margin:7px 2px 0;min-height:15px}
+</style>
+</head>
+<body>
+<header>
+  <div class="sum">
+    <span class="total" id="total">—</span>
+    <span class="delta" id="delta"></span>
+    <span class="dot" id="dot2" style="margin-left:auto"></span>
+  </div>
+  <div class="meta">
+    <span class="dot" id="dot"></span><span id="state">загрузка</span>
+    <span class="sep">·</span><span id="wake"></span>
+  </div>
+  <div id="halt"></div>
+  <nav>
+    <button class="on" data-tab="feed">Сессия</button>
+    <button data-tab="trades">Сделки</button>
+    <button data-tab="stats">Итог</button>
+  </nav>
+</header>
+<main id="main"></main>
+<div class="composer" id="composer" hidden>
+  <div class="cbox">
+    <textarea id="input" rows="1" placeholder="Написать агенту…"></textarea>
+    <button id="send" disabled>↑</button>
+  </div>
+  <div class="note" id="note"></div>
+</div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+if (tg) { tg.ready(); tg.expand(); tg.setHeaderColor?.('#100f0e'); tg.setBackgroundColor?.('#100f0e'); }
+
+const KEY = new URLSearchParams(location.search).get('k') || '';
+const api = async (path, params = {}) => {
+  const q = new URLSearchParams({ ...params, ...(KEY ? { k: KEY } : {}) });
+  const r = await fetch(`${path}?${q}`, {
+    headers: tg?.initData ? { 'X-Telegram-Init-Data': tg.initData } : {}
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+};
+
+const money = n => Math.round(n).toLocaleString('ru-RU') + ' ₽';
+const signed = n => (n >= 0 ? '+' : '−') + Math.abs(Math.round(n)).toLocaleString('ru-RU');
+const clock = ts => new Date(ts * 1000).toLocaleTimeString('ru-RU',
+  { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' });
+const day = ts => new Date(ts * 1000).toLocaleDateString('ru-RU',
+  { day: 'numeric', month: 'short', timeZone: 'Europe/Moscow' });
+const esc = s => (s || '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+const ago = s => s < 60 ? 'только что'
+  : s < 3600 ? `${Math.floor(s / 60)} мин назад`
+  : s < 86400 ? `${Math.floor(s / 3600)} ч назад`
+  : `${Math.floor(s / 86400)} дн назад`;
+
+let tab = 'feed', lastId = 0, oldestLoaded = 0, oldestExists = 0, pinned = true;
+let working = false, timer = null;
+const main = document.getElementById('main');
+
+/* ── шапка ─────────────────────────────────────────────── */
+function header(s) {
+  document.getElementById('total').textContent = money(s.total);
+  const d = document.getElementById('delta');
+  const cls = Math.abs(s.delta) < 1 ? 'flat' : s.delta > 0 ? 'pos' : 'neg';
+  d.className = 'delta ' + cls;
+  d.textContent = `${signed(s.delta)} ₽ · ${s.delta >= 0 ? '+' : '−'}${Math.abs(s.delta_pct).toFixed(2)}%`;
+
+  const live = s.state === 'работает';
+  document.getElementById('dot').className = 'dot' + (live ? ' live' : '');
+  document.getElementById('dot2').className = 'dot' + (live ? ' live' : '');
+  document.getElementById('state').textContent = live ? 'работает' : 'спит';
+
+  const w = document.getElementById('wake');
+  if (s.halted) w.textContent = '';
+  else if (s.wake_at) {
+    const m = Math.max(0, (s.wake_at - s.now) / 60);
+    w.textContent = 'подъём ' + clock(s.wake_at) + (m < 600 ? ` · через ${m < 60 ? Math.round(m) + ' мин' : (m / 60).toFixed(1) + ' ч'}` : '');
+  } else w.textContent = s.last_tool ? `${s.last_tool} · ${ago(s.now - s.last_tool_ts)}` : '';
+
+  document.getElementById('halt').innerHTML = s.halted
+    ? `<div class="halt">Прогон остановлен: ${esc(s.halted)}</div>` : '';
+}
+
+/* ── лента ─────────────────────────────────────────────── */
+const WAKE = { alarm: 'будильник', check: 'проверка', report: 'дневной отчёт',
+  deadman: 'нет расписания', operator: 'сообщение оператора', service: 'служебное' };
+const ICON = { mcpToolCall: '◆', commandExecution: '›', webSearch: '⌕', collabToolCall: '⇉', fileChange: '✎' };
+
+function render(it) {
+  const t = `<span class="time">${clock(it.ts)}</span>`;
+  const sub = it.own ? '' : ' sub';
+
+  if (it.kind === 'wake')
+    return `<div class="ev wake"><div class="lbl">Пробуждение · ${esc(WAKE[it.title] || it.title || '')} <span class="time">${day(it.ts)} ${clock(it.ts)}</span></div>
+      <div class="txt">${esc((it.body || '').split('\n\n').slice(1).join(' ').slice(0, 260))}</div></div>`;
+
+  if (it.kind === 'agentMessage')
+    return `<div class="ev say${sub}">${t}${esc(it.body)}</div>`;
+
+  if (it.kind === 'userMessage')
+    return `<div class="ev op"><div class="who">Оператор</div><div class="txt">${esc(it.body.replace(/^(Служебное|Сообщение от оператора):\s*/, ''))}</div></div>`;
+
+  if (it.kind === 'reasoning')
+    return `<div class="ev think${sub}" onclick="this.classList.toggle('full')">${esc(it.body.replace(/\*\*/g, '').slice(0, 160))}</div>`;
+
+  if (it.kind === 'error')
+    return `<div class="ev err">${esc(it.body)}</div>`;
+
+  if (['mcpToolCall', 'commandExecution', 'webSearch', 'collabToolCall', 'fileChange'].includes(it.kind)) {
+    const label = it.title || it.kind;
+    const has = (it.body || '').trim().length > 0;
+    const id = 'o' + it.id;
+    return `<div class="ev${sub}">
+      <div class="act" ${has ? `onclick="document.getElementById('${id}').classList.toggle('hide')"` : ''}>
+        <span class="ic">${ICON[it.kind] || '·'}</span>
+        <span class="name">${esc(label.slice(0, 120))}</span>
+        ${has ? '<span class="hint">развернуть</span>' : ''}
+      </div>
+      ${has ? `<div class="out hide" id="${id}">${esc(it.body.slice(0, 6000))}</div>` : ''}
+    </div>`;
+  }
+  return '';
+}
+
+async function feedInit() {
+  composer.hidden = false;
+  main.innerHTML = '<div class="empty">загрузка…</div>';
+  const d = await api('/api/transcript', { limit: 140 });
+  oldestExists = d.oldest;
+  const html = d.items.map(render).join('');
+  main.innerHTML = (d.items.length && d.items[0].id > oldestExists
+    ? '<button class="older" onclick="loadOlder()">Показать раньше</button>' : '') +
+    `<div id="stream">${html || '<div class="empty">Пока пусто</div>'}</div>`;
+  if (d.items.length) { lastId = d.items[d.items.length - 1].id; oldestLoaded = d.items[0].id; }
+  scrollDown();
+}
+
+window.loadOlder = async () => {
+  const d = await api('/api/transcript', { before: oldestLoaded, limit: 120 });
+  if (!d.items.length) return;
+  const s = document.getElementById('stream');
+  const h = s.scrollHeight;
+  s.insertAdjacentHTML('afterbegin', d.items.map(render).join(''));
+  oldestLoaded = d.items[0].id;
+  window.scrollBy(0, s.scrollHeight - h);
+  if (oldestLoaded <= oldestExists) document.querySelector('.older')?.remove();
+};
+
+async function feedPoll() {
+  if (tab !== 'feed' || !lastId) return;
+  const d = await api('/api/transcript', { after: lastId, limit: 200 });
+  if (!d.items.length) return;
+
+  // Пришедшее из журнала сообщение оператора заменяет оптимистичную копию.
+  d.items.filter(i => i.kind === 'userMessage').forEach(i => {
+    document.querySelectorAll('[data-optimistic]').forEach(n => {
+      if (i.body.includes(n.dataset.optimistic.slice(0, 40))) n.remove();
+    });
+  });
+
+  const liveEl = document.getElementById('live');
+  const html = d.items.map(render).join('');
+  if (liveEl) liveEl.insertAdjacentHTML('beforebegin', html);
+  else document.getElementById('stream')?.insertAdjacentHTML('beforeend', html);
+  lastId = d.items[d.items.length - 1].id;
+  if (pinned) scrollDown();
+}
+
+const scrollDown = () => requestAnimationFrame(() =>
+  window.scrollTo({ top: document.body.scrollHeight }));
+const head = document.querySelector('header');
+let typing = false;
+const slim = () => head.classList.toggle('slim', typing || scrollY > 30);
+
+addEventListener('scroll', () => {
+  pinned = innerHeight + scrollY >= document.body.scrollHeight - 120;
+  slim();
+}, { passive: true });
+
+/* ── сделки ────────────────────────────────────────────── */
+async function trades() {
+  const d = await api('/api/trades');
+  main.innerHTML = d.trades.length ? d.trades.map(t => `
+    <div class="trade">
+      <div class="top">
+        <span class="tk">${esc(t.ticker || '—')}</span>
+        <span class="side ${t.direction}">${t.direction === 'buy' ? 'покупка' : 'продажа'}</span>
+        <span class="time">${day(t.ts)} ${clock(t.ts)}</span>
+        <span class="amt">${money(t.total || 0)}</span>
+      </div>
+      <div class="time">${t.lots} лот · ${t.price ? t.price.toFixed(2) + ' ₽' : '—'} · ${esc((t.status || '').replace('EXECUTION_REPORT_STATUS_', ''))}</div>
+      ${t.rationale ? `<div class="why">${esc(t.rationale)}</div>` : ''}
+    </div>`).join('')
+    : '<div class="empty">Сделок пока не было</div>';
+}
+
+/* ── итог ──────────────────────────────────────────────── */
+function sparkline(points, start) {
+  if (points.length < 2) return '';
+  const w = 700, h = 130, pad = 6;
+  const xs = points.map(p => p.ts), ys = points.map(p => p.total);
+  const [x0, x1] = [Math.min(...xs), Math.max(...xs)];
+  const lo = Math.min(...ys, start), hi = Math.max(...ys, start);
+  const span = (hi - lo) || 1;
+  const X = t => pad + (w - 2 * pad) * ((t - x0) / ((x1 - x0) || 1));
+  const Y = v => pad + (h - 2 * pad) * (1 - (v - lo) / span);
+  const line = points.map((p, i) => `${i ? 'L' : 'M'}${X(p.ts).toFixed(1)},${Y(p.total).toFixed(1)}`).join('');
+  const area = `${line}L${X(x1).toFixed(1)},${h - pad}L${X(x0).toFixed(1)},${h - pad}Z`;
+  return `<svg class="chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <path class="area" d="${area}"/>
+    <path class="base" d="M${pad},${Y(start).toFixed(1)}L${w - pad},${Y(start).toFixed(1)}"/>
+    <path d="${line}"/></svg>`;
+}
+
+async function stats() {
+  const [s, e] = await Promise.all([api('/api/state'), api('/api/equity')]);
+  const pos = s.positions || [];
+  main.innerHTML = sparkline(e.points, s.start) + `
+    <div class="rows">
+      <div class="row"><span>Сейчас</span><span>${money(s.total)}</span></div>
+      <div class="row"><span>Свободные деньги</span><span>${money(s.cash)}</span></div>
+      <div class="row"><span>Старт</span><span>${money(s.start)}</span></div>
+      <div class="row"><span>Результат</span><span class="${s.delta >= 0 ? 'pos' : 'neg'}">${signed(s.delta)} ₽ · ${s.delta_pct.toFixed(2)}%</span></div>
+      <div class="row"><span>Просадка от максимума</span><span>${s.drawdown_pct.toFixed(2)}%</span></div>
+      <div class="row"><span>Порог остановки</span><span>${money(s.floor)}</span></div>
+      <div class="row"><span>Сделок</span><span>${s.trades}</span></div>
+    </div>
+    ${pos.length ? '<div class="rows">' + pos.map(p => `
+      <div class="pos-item"><span>${esc(p.ticker || '?')}<br><span class="q">${p.lots || 0} лот · ${(p.current_price || 0).toFixed(2)} ₽</span></span>
+      <span class="${(p.yield || 0) >= 0 ? 'pos' : 'neg'}">${signed(p.yield || 0)} ₽</span></div>`).join('') + '</div>'
+      : '<div class="empty">Открытых позиций нет</div>'}`;
+}
+
+/* ── переключение ──────────────────────────────────────── */
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  tab = b.dataset.tab;
+  composer.hidden = tab !== 'feed';
+  ({ feed: feedInit, trades, stats })[tab]();
+});
+
+/* ── переписка ─────────────────────────────────────────── */
+const input = document.getElementById('input'), sendBtn = document.getElementById('send'),
+      note = document.getElementById('note'), composer = document.getElementById('composer');
+
+input.addEventListener('focus', () => { typing = true; slim(); });
+input.addEventListener('blur', () => { typing = false; slim(); });
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 150) + 'px';
+  sendBtn.disabled = !input.value.trim();
+});
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !/Mobi|Android/i.test(navigator.userAgent)) {
+    e.preventDefault(); send();
+  }
+});
+sendBtn.onclick = send;
+
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = ''; input.style.height = 'auto'; sendBtn.disabled = true;
+
+  // Показываем сообщение сразу: ждать круга опроса — выглядит как потеря.
+  document.getElementById('stream')?.insertAdjacentHTML('beforeend',
+    `<div class="ev op" data-optimistic="${esc(text).slice(0,80)}">
+       <div class="who">Оператор</div><div class="txt">${esc(text)}</div></div>`);
+  scrollDown();
+
+  note.textContent = working
+    ? 'Агент занят — сообщение придёт в текущий ход'
+    : 'Отправлено, будит агента…';
+  try {
+    const r = await fetch('/api/say' + (KEY ? `?k=${KEY}` : ''), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json',
+                 ...(tg?.initData ? { 'X-Telegram-Init-Data': tg.initData } : {}) },
+      body: JSON.stringify({ text })
+    });
+    if (!r.ok) throw new Error();
+    working = true;                     // ответ вот-вот пойдёт, ускоряем опрос
+    setTimeout(tickNow, 400);
+  } catch {
+    note.textContent = 'Не удалось отправить — проверь связь';
+  }
+  setTimeout(() => { if (note.textContent.startsWith('Отправлено')) note.textContent = ''; }, 4000);
+  setTimeout(() => { if (note.textContent.startsWith('Агент занят')) note.textContent = ''; }, 25000);
+}
+
+/* Живой блок: чем занят и что уже написал */
+function live(l) {
+  working = l.state === 'работает';
+  let el = document.getElementById('live');
+  if (!working && !l.text) {
+    el?.remove();
+    if (note.textContent.startsWith('Агент занят')) note.textContent = '';
+    return;
+  }
+  if (!el) {
+    document.getElementById('stream')?.insertAdjacentHTML('beforeend', '<div class="ev live" id="live"></div>');
+    el = document.getElementById('live');
+    if (!el) return;
+  }
+  const [act, arg] = (l.activity || (l.text ? 'отвечает' : 'работает')).split(/:\s*/);
+  el.innerHTML =
+    `<div class="doing"><span class="pulse"></span><b>${esc(act)}</b>${arg ? `<span class="q">${esc(arg)}</span>` : ''}</div>` +
+    (l.text ? `<div class="streamed">${esc(l.text)}</div>` : '');
+  if (pinned) scrollDown();
+}
+
+/* Опрос подстраивается: часто пока агент работает, редко пока спит.
+   Цикл перезапускает себя после каждого тика — иначе он обрывается. */
+function loop(delay) {
+  clearTimeout(timer);
+  timer = setTimeout(async () => {
+    try { await tick(); } catch (e) {}
+    loop(working ? 1200 : 4000);
+  }, delay ?? (working ? 1200 : 4000));
+}
+
+/* Немедленный тик: после отправки ждать круг опроса незачем. */
+async function tickNow() {
+  try { await tick(); } catch (e) {}
+  loop(working ? 1200 : 3000);
+}
+
+async function tick() {
+  try { header(await api('/api/state')); } catch (e) {}
+  if (tab !== 'feed') return;
+  try { live(await api('/api/live')); } catch (e) {}
+  try { await feedPoll(); } catch (e) {}
+}
+
+feedInit().then(() => { tick(); loop(2000); });
+</script>
+</body>
+</html>
