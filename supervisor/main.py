@@ -88,8 +88,16 @@ class Supervisor:
     # --- запуск ------------------------------------------------------------
 
     def start_codex(self) -> None:
+        # Codex читает ключ провайдера из собственного окружения (env_key в
+        # config.toml). systemd его туда не кладёт, поэтому подставляем сами
+        # из файла секретов — иначе каждый ход падает с
+        # "Missing environment variable".
         env = dict(os.environ)
         env.setdefault("HOME", "/home/agent")
+        for name in ("OMNIROUTE_API_KEY", "OMNIROUTE_BASE_URL"):
+            value = config.secret(name)
+            if value:
+                env[name] = value
         self.codex = AppServer([CODEX_BIN, "app-server"], cwd=WORKDIR, env=env)
         self.codex.start()
 
@@ -192,15 +200,27 @@ class Supervisor:
         for event in self.codex.drain_events():
             method = event.get("method")
             params = event.get("params") or {}
+
             if method == "turn/completed":
                 journal.kv_set("agent_state", "спит")
                 self.last_activity = time.time()
-                usage = params.get("usage") or {}
-                journal.log_event("turn_completed", {"usage": usage})
+                journal.log_event("turn_completed", {"usage": params.get("usage") or {}})
             elif method == "item/completed":
                 item = params.get("item") or {}
-                if item.get("type") == "agent_message":
-                    journal.log_event("agent_message", {"text": (item.get("text") or "")[:2000]})
+                # app-server отдаёт типы в camelCase: agentMessage, userMessage.
+                kind = item.get("type")
+                if kind == "agentMessage":
+                    text = (item.get("text") or "")[:4000]
+                    journal.log_event("agent_message", {"text": text})
+                    self.last_activity = time.time()
+                elif kind == "error":
+                    journal.log_event("item_error", {"message": str(item.get("message"))[:500]})
+            elif method == "error":
+                # Ошибки хода приходят нотификацией, а не в stderr: без этого
+                # ход молча завершается пустым и причина не видна нигде.
+                detail = (params.get("error") or {}).get("message", str(params))
+                journal.log_event("turn_error", {"error": str(detail)[:500]})
+                self.bot.send(f"⚠️ Ошибка хода агента:\n{str(detail)[:500]}", keyboard=False)
 
     def tick_inbox(self) -> None:
         while True:

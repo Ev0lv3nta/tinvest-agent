@@ -8,9 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # Файлы с секретами. Codex не пробрасывает окружение в MCP-подпроцесс,
 # поэтому читаем сами.
 ENV_FILES = [
-    Path("/home/agent/.tinvest.env"),
-    Path("/home/agent/.omniroute.env"),
-    Path("/home/agent/.telegram.env"),
+    Path("/home/agent/.agent.env"),
     ROOT / ".env",
 ]
 

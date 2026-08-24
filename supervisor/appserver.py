@@ -163,9 +163,9 @@ class AppServer:
         return self.thread_id
 
     def resume_thread(self, thread_id: str) -> str:
-        result = self.request(
-            "thread/resume", {"threadId": thread_id, "excludeTurns": True}, timeout=120
-        )
+        # excludeTurns требует experimentalApi, а без него запрос отклоняется
+        # целиком и сессия теряется при каждом перезапуске.
+        result = self.request("thread/resume", {"threadId": thread_id}, timeout=180)
         thread = result.get("thread") or {}
         self.thread_id = thread.get("id") or thread_id
         return self.thread_id
