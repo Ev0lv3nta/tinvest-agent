@@ -1,7 +1,9 @@
 [Unit]
 Description=Супервизор торгового агента
-After=network-online.target
+After=network-online.target omniroute-tunnel.service
 Wants=network-online.target
+# Без канала к модели агент не работает: поднимаем туннель первым.
+Requires=omniroute-tunnel.service
 
 [Service]
 Type=simple
@@ -12,6 +14,7 @@ Environment=PYTHONPATH=/opt/tinvest-agent
 Environment=PYTHONUNBUFFERED=1
 Environment=AGENT_DB=/home/agent/state/agent.db
 Environment=AGENT_WORKDIR=/home/agent/work
+Environment=AGENT_DATA_DIR=/home/agent/data
 Environment=HOME=/home/agent
 ExecStart=/usr/bin/python3 -m supervisor.main
 Restart=always

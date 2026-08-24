@@ -9,9 +9,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -920,9 +922,23 @@ def tool_send_report(summary: str, path: str) -> dict:
 # --- цикл JSON-RPC --------------------------------------------------------
 
 
+_WRITE_LOCK = threading.Lock()
+
+# Заявки сериализуются между собой: два параллельных вызова могли бы
+# увидеть одни и те же свободные деньги и оба пройти проверку.
+_ORDER_LOCK = threading.Lock()
+SERIALIZED = {"buy", "sell", "cancel_order"}
+
+# Поиск занимает в среднем сорок секунд и до трёх минут по таймауту. При
+# строго последовательной обработке всё это время тот же процесс не
+# обслуживал ни портфель, ни продажу, ни снятие заявки.
+POOL_SIZE = 6
+
+
 def _send(message: dict) -> None:
-    sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    with _WRITE_LOCK:
+        sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
 
 
 def _render(tool: str, payload: Any) -> str:
@@ -977,7 +993,30 @@ def _call_tool(name: str, arguments: dict) -> tuple[bool, Any]:
     return ok, payload
 
 
+def _handle_call(request_id, params: dict) -> None:
+    name = params.get("name", "")
+    arguments = params.get("arguments") or {}
+    if name in SERIALIZED:
+        with _ORDER_LOCK:
+            ok, payload = _call_tool(name, arguments)
+    else:
+        ok, payload = _call_tool(name, arguments)
+    _send(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [{"type": "text", "text": _render(name, payload)}],
+                "isError": not ok,
+            },
+        }
+    )
+
+
 def main() -> None:
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=POOL_SIZE, thread_name_prefix="tool"
+    )
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1006,19 +1045,7 @@ def main() -> None:
             _send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}})
         elif method == "tools/call":
             params = request.get("params") or {}
-            name = params.get("name", "")
-            ok, payload = _call_tool(name, params.get("arguments") or {})
-            text = _render(name, payload)
-            _send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "content": [{"type": "text", "text": text}],
-                        "isError": not ok,
-                    },
-                }
-            )
+            pool.submit(_handle_call, request_id, params)
         elif method == "ping":
             _send({"jsonrpc": "2.0", "id": request_id, "result": {}})
         elif request_id is not None:
@@ -1029,6 +1056,7 @@ def main() -> None:
                     "error": {"code": -32601, "message": f"метод не поддерживается: {method}"},
                 }
             )
+    pool.shutdown(wait=False)
 
 
 if __name__ == "__main__":
