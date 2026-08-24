@@ -256,12 +256,10 @@ class SandboxClient:
 
     # --- рыночные данные ---------------------------------------------------
 
-    # Поиск по названию эмитента возвращает вперемешку акции, облигации и фонды,
-    # причём облигаций у крупных эмитентов десятки. Без упорядочивания агент
-    # получает список бондов на запрос "Сбербанк" и не видит акцию.
-    _KIND_ORDER = {"share": 0, "etf": 1, "currency": 2, "future": 3, "bond": 4}
-
-    def _find_raw(self, query: str, kind: str = "") -> list[dict]:
+    def find_instrument(
+        self, query: str, limit: int = 10, kind: str = ""
+    ) -> list[dict]:
+        """Поиск инструмента. `kind` — INSTRUMENT_TYPE_SHARE, _BOND, _ETF и т.п."""
         payload: dict[str, Any] = {"query": query, "apiTradeAvailableFlag": True}
         if kind:
             payload["instrumentKind"] = kind
@@ -279,30 +277,7 @@ class SandboxClient:
                 "api_trade_available": item.get("apiTradeAvailableFlag"),
             }
             for item in raw.get("instruments", [])
-        ]
-
-    def find_instrument(
-        self, query: str, limit: int = 10, kind: str = ""
-    ) -> list[dict]:
-        results = self._find_raw(query, kind)
-
-        # Ответ обрезан на стороне API, и у крупных эмитентов его целиком
-        # занимают облигации: на запрос "Сбербанк" акции в выдаче нет вовсе.
-        # Досылаем отдельный запрос по акциям и ставим их первыми.
-        if not kind and not any(r["type"] == "share" for r in results):
-            shares = self._find_raw(query, "INSTRUMENT_TYPE_SHARE")
-            known = {r["instrument_id"] for r in shares}
-            results = shares + [r for r in results if r["instrument_id"] not in known]
-
-        needle = query.strip().upper()
-        results.sort(
-            key=lambda r: (
-                0 if (r["ticker"] or "").upper() == needle else 1,
-                self._KIND_ORDER.get(r["type"], 9),
-                len(r["name"] or ""),
-            )
-        )
-        return results[:limit]
+        ][:limit]
 
     def last_price(self, instrument_ids: list[str]) -> list[dict]:
         raw = self.call(
