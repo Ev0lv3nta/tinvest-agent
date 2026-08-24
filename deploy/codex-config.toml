@@ -1,0 +1,26 @@
+# Конфигурация Codex для торгового агента.
+# Раскладывается install.sh в /home/agent/.codex/config.toml
+
+model = "codex/gpt-5.6-sol-high"
+model_provider = "omniroute"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.omniroute]
+name = "OmniRoute USA"
+base_url = "https://rendering-found-paid-listprice.trycloudflare.com/v1"
+env_key = "OMNIROUTE_API_KEY"
+wire_api = "responses"
+
+# Инструменты шлюза. Без default_tools_approval_mode = "approve" вызовы
+# отклоняются: глобальный approval_policy = "never" означает «не спрашивать»,
+# а не «разрешить».
+[mcp_servers.trading]
+command = "/usr/bin/python3"
+args = ["-m", "gateway.server"]
+cwd = "/opt/tinvest-agent"
+default_tools_approval_mode = "approve"
+
+[mcp_servers.trading.env]
+AGENT_DB = "/home/agent/state/agent.db"
+PYTHONPATH = "/opt/tinvest-agent"
