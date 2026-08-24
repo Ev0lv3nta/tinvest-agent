@@ -1,6 +1,7 @@
 """Путь заявки: карточка, идемпотентность, поведение при обрыве связи."""
 
 import unittest
+import unittest.mock
 
 from gateway import config, guards, journal, server
 from gateway.tinvest import TInvestError
@@ -235,3 +236,61 @@ class Loopholes(JournalCase):
         with self.assertRaises(guards.GuardRejection):
             self.buy()
         self.assertEqual(journal.orders_last_hour(), 1)
+
+
+class ApiRetries(JournalCase):
+    """Песочница отвечает Internal error примерно на половину запросов."""
+
+    def client(self, failures, code="70001"):
+        from gateway import tinvest
+
+        client = tinvest.SandboxClient("token", "acc")
+        calls = {"n": 0}
+
+        def flaky(service, method, payload=None):
+            calls["n"] += 1
+            if calls["n"] <= failures:
+                raise tinvest.TInvestError(f"{service}/{method}: Internal error", code=code)
+            return {"operations": [{"figi": "F"}]}
+
+        client._call_once = flaky
+        return client, calls
+
+    def test_временный_отказ_переживается(self):
+        import gateway.tinvest as t
+
+        client, calls = self.client(failures=3)
+        with unittest.mock.patch.object(t.time, "sleep"):
+            result = client.call("SandboxService", "GetSandboxOperations", {})
+        self.assertEqual(len(result["operations"]), 1)
+        self.assertEqual(calls["n"], 4)
+
+    def test_повторы_видны_в_журнале(self):
+        import gateway.tinvest as t
+
+        client, _ = self.client(failures=2)
+        with unittest.mock.patch.object(t.time, "sleep"):
+            client.call("SandboxService", "GetSandboxOperations", {})
+        rows = journal.connect().execute(
+            "SELECT COUNT(*) AS n FROM events WHERE kind='api_retry'"
+        ).fetchone()
+        self.assertEqual(rows["n"], 2)
+
+    def test_содержательная_ошибка_не_повторяется(self):
+        import gateway.tinvest as t
+
+        # 30079 — вне торговой сессии. Повторять бессмысленно.
+        client, calls = self.client(failures=99, code="30079")
+        with unittest.mock.patch.object(t.time, "sleep"):
+            with self.assertRaises(t.TInvestError):
+                client.call("SandboxService", "PostSandboxOrder", {})
+        self.assertEqual(calls["n"], 1)
+
+    def test_исчерпание_повторов_даёт_ошибку(self):
+        import gateway.tinvest as t
+
+        client, calls = self.client(failures=99)
+        with unittest.mock.patch.object(t.time, "sleep"):
+            with self.assertRaises(t.TInvestError):
+                client.call("SandboxService", "GetSandboxOperations", {})
+        self.assertEqual(calls["n"], config.API_RETRIES + 1)

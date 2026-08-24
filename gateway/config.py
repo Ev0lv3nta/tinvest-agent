@@ -63,6 +63,11 @@ MAX_POSITIONS = 2            # одновременно открытых поз�
 MAX_ENTRIES_PER_DAY = 4      # число решений, а не скорость заявок
 LOSS_COOLDOWN = 45 * 60      # после убыточного выхода — пауза перед входом
 
+# Песочница регулярно отвечает Internal error на корректные запросы:
+# замер 24.08 дал девять отказов из двадцати на одном и том же чтении.
+API_RETRIES = 4
+API_RETRY_DELAY = 0.4
+
 SEARCH_MODEL = "gpt-5.6-luna"
 SEARCH_TIMEOUT = 180
 HTTP_TIMEOUT = 60

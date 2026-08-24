@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import ssl
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -25,13 +26,39 @@ from . import config
 _SSL_CONTEXT = ssl.create_default_context(cafile=config.CA_BUNDLE)
 
 
+# Коды, за которыми стоит не наша ошибка, а состояние сервера. Повтор
+# осмысленен: тот же запрос через секунду обычно проходит.
+RETRYABLE_CODES = {"70001", "70002", "80002"}
+
+
 class TInvestError(RuntimeError):
     """Ошибка API. `code` — числовой код T-Invest (например, 30079)."""
 
-    def __init__(self, message: str, code: str = "", http_status: int = 0):
+    def __init__(
+        self,
+        message: str,
+        code: str = "",
+        http_status: int = 0,
+        retryable: Optional[bool] = None,
+    ):
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+        self.retryable = (
+            retryable
+            if retryable is not None
+            else (code in RETRYABLE_CODES or http_status in (429, 500, 502, 503, 504))
+        )
+
+
+def journal_retry(service: str, method: str, exc: "TInvestError", attempt: int) -> None:
+    """Повторы видны в журнале: если их станет много, это само по себе факт."""
+    from . import journal
+
+    journal.log_event(
+        "api_retry",
+        {"method": f"{service}/{method}", "attempt": attempt, "error": str(exc)[:160]},
+    )
 
 
 def _money(value: Optional[dict]) -> float:
@@ -64,7 +91,38 @@ class SandboxClient:
 
     # --- транспорт ---------------------------------------------------------
 
-    def call(self, service: str, method: str, payload: Optional[dict] = None) -> dict:
+    def call(
+        self,
+        service: str,
+        method: str,
+        payload: Optional[dict] = None,
+        retries: int = config.API_RETRIES,
+    ) -> dict:
+        """Вызов с повтором на временных отказах песочницы.
+
+        Песочница регулярно отвечает `Internal error` (код 70001) на
+        совершенно корректные запросы — замер 24.08 дал девять отказов из
+        двадцати на одном и том же чтении, включая портфель и заявки.
+        Без повторов половина сверок и котировок просто не доезжает, а
+        отказ выглядит как содержательный ответ API.
+
+        Повтор безопасен и для отправки заявки: `orderId` — клиентский ключ
+        идемпотентности, брокер по нему вернёт ту же заявку, а не создаст
+        вторую.
+        """
+        delay = config.API_RETRY_DELAY
+        for attempt in range(retries + 1):
+            try:
+                return self._call_once(service, method, payload)
+            except TInvestError as exc:
+                if attempt >= retries or not exc.retryable:
+                    raise
+                journal_retry(service, method, exc, attempt + 1)
+                time.sleep(delay)
+                delay *= 2
+        raise TInvestError(f"{service}/{method}: не удалось после {retries} повторов")
+
+    def _call_once(self, service: str, method: str, payload: Optional[dict] = None) -> dict:
         url = f"{config.TINVEST_SANDBOX_URL}/{config.TINVEST_NS}.{service}/{method}"
         body = json.dumps(payload or {}).encode()
         request = urllib.request.Request(
@@ -94,7 +152,13 @@ class SandboxClient:
                 f"{service}/{method}: {message}", code=code, http_status=exc.code
             ) from exc
         except urllib.error.URLError as exc:
-            raise TInvestError(f"{service}/{method}: сеть недоступна ({exc.reason})") from exc
+            raise TInvestError(
+                f"{service}/{method}: сеть недоступна ({exc.reason})", retryable=True
+            ) from exc
+        except (TimeoutError, OSError) as exc:
+            raise TInvestError(
+                f"{service}/{method}: обрыв связи ({exc})", retryable=True
+            ) from exc
 
     def _sandbox(self, method: str, payload: Optional[dict] = None) -> dict:
         data = dict(payload or {})
