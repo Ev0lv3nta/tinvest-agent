@@ -22,6 +22,11 @@ DB_PATH = os.environ.get("AGENT_DB", "/home/agent/state/agent.db")
 # сама таблица живёт файлом: агент читает её своим кодом, а не глазами.
 DATA_DIR = Path(os.environ.get("AGENT_DATA_DIR", "/home/agent/data"))
 
+# Рабочая директория агента. Отчёты отправляются только отсюда.
+WORKDIR = Path(os.environ.get("AGENT_WORKDIR", "/home/agent/work"))
+REPORTS_DIR = WORKDIR / "notes" / "reports"
+MAX_REPORT_BYTES = 2_000_000
+
 # Потолок на размер ответа инструмента. Всё, что больше, выгружается в файл.
 # Это страховка на уровне транспорта: даже если кто-то добавит инструмент,
 # возвращающий таблицу на тысячу строк, она не окажется в сессии текстом.

@@ -23,6 +23,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from . import config, guards, journal, marketdata, search
+from .guards import GuardRejection
 from .tinvest import SandboxClient, TInvestError
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -65,15 +66,39 @@ def _parse_when(value: str) -> float:
     return parsed.timestamp()
 
 
+def _report_path(path: str) -> Path:
+    """Отчёт берётся только из notes/reports и только markdown.
+
+    Инструмент принимает путь от модели и отправляет файл в Telegram. Без
+    ограничения это способ выгрузить наружу любой читаемый файл, включая
+    секреты, — а токен брокера лежит на этой же машине.
+    """
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = config.REPORTS_DIR / candidate
+    resolved = candidate.resolve()
+    root = config.REPORTS_DIR.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"отчёт должен лежать в {root}, получено: {resolved}")
+    if resolved.suffix.lower() != ".md":
+        raise ValueError("отчёт должен быть markdown-файлом (.md)")
+    if not resolved.is_file():
+        raise ValueError(f"файл не найден: {resolved}")
+    size = resolved.stat().st_size
+    if size > config.MAX_REPORT_BYTES:
+        raise ValueError(
+            f"файл {size} байт при пределе {config.MAX_REPORT_BYTES}"
+        )
+    return resolved
+
+
 def _telegram_document(path: str, caption: str) -> bool:
     """Отправка файла в Telegram: multipart собираем вручную, без зависимостей."""
     token = config.secret("TELEGRAM_BOT_TOKEN")
     chat_id = config.secret("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         return False
-    file_path = Path(path)
-    if not file_path.is_file():
-        raise ValueError(f"файл не найден: {path}")
+    file_path = _report_path(path)
 
     boundary = f"----tinvest{uuid.uuid4().hex}"
     parts: list[bytes] = []
@@ -121,43 +146,173 @@ def _telegram(text: str) -> bool:
         return False
 
 
-def _order(direction: str, instrument_id: str, lots: int, price, rationale: str) -> dict:
-    api = client()
-    guards.check_not_halted()
-    guards.check_rate_limit()
+def _resolve(instrument_id: str) -> dict:
+    """Тикер, FIGI и размер лота. Справочник на диске, иначе точный вызов API."""
+    ticker = marketdata.ticker_for(instrument_id)
+    if ticker:
+        entry = marketdata.resolve(ticker) or {}
+        if entry.get("figi"):
+            return {"ticker": ticker, "figi": entry["figi"], "lot": entry.get("lot", 1)}
+    info = client().instrument_by_uid(instrument_id)
+    if info.get("ticker"):
+        marketdata.remember_instrument(info)
+    return {
+        "ticker": info.get("ticker") or instrument_id[:8],
+        "figi": info.get("figi") or "",
+        "lot": int(info.get("lot") or 1),
+    }
 
-    # Порог проверяется перед каждой сделкой по свежему портфелю, а не по
-    # кешу: между вызовами цена позиций могла уехать.
-    guards.check_capital_floor(api.portfolio()["total"])
+
+def _atr_15m(instrument_id: str, ticker: str) -> float:
+    """Шум бумаги в единицах цены. Файл кешируется, лишнего запроса нет."""
+    try:
+        summary = marketdata.candles(
+            client(), instrument_id, "CANDLE_INTERVAL_15_MIN", 3, name=ticker
+        )
+    except Exception:  # noqa: BLE001 — барьер по шуму не должен ломать сделку
+        return 0.0
+    return float(summary.get("atr14") or 0.0)
+
+
+def _check_ambiguous(instrument_id: str, ticker: str) -> None:
+    """Не отправлять новую заявку, пока не выяснена судьба предыдущей.
+
+    Если брокер принял заявку, а ответ потерялся, повтор с новым ключом
+    создаст вторую позицию. Поэтому сначала спрашиваем брокера про наш
+    собственный идентификатор.
+    """
+    pending = journal.ambiguous_intents(instrument_id)
+    if not pending:
+        return
+    try:
+        live = {order["order_id"] for order in client().active_orders()}
+    except TInvestError:
+        live = set()
+    unresolved = []
+    for intent in pending:
+        if intent["request_id"] in live:
+            journal.set_intent_state(intent["request_id"], "live", "нашлась в активных")
+            unresolved.append(intent["request_id"])
+        else:
+            unresolved.append(intent["request_id"])
+    if unresolved:
+        raise GuardRejection(
+            f"Отклонено: по {ticker} есть заявка с неизвестной судьбой "
+            f"({unresolved[0]}). Ответ брокера не дошёл, поэтому она могла быть "
+            f"принята. Проверь active_orders и operations, при необходимости "
+            f"сними её через cancel_order — и только потом отправляй новую."
+        )
+
+
+def _order(
+    direction: str,
+    instrument_id: str,
+    lots: int,
+    price,
+    rationale: str,
+    card: dict | None = None,
+) -> dict:
+    api = client()
+    buying = direction == "ORDER_DIRECTION_BUY"
+    market = price is None
+
+    guards.check_rate_limit()
+    instrument = _resolve(instrument_id)
+    ticker, figi, lot_size = instrument["ticker"], instrument["figi"], instrument["lot"]
+    _check_ambiguous(instrument_id, ticker)
+
+    checks: dict = {}
+    if buying:
+        # Порядок важен: остановка прогона и дневной стоп закрывают вход, но
+        # не выход. Продажа и снятие заявки доступны всегда.
+        guards.check_entry_allowed()
+        portfolio = api.portfolio()
+        journal.log_snapshot(portfolio["total"], portfolio["cash"], portfolio["positions"])
+        guards.check_capital_floor(portfolio["total"])
+        guards.check_daily_loss(portfolio["total"])
+        guards.check_positions(portfolio, instrument_id)
+        guards.check_entries_today()
+        guards.check_cooldown(instrument_id, ticker)
+
+        entry = float(price) if price is not None else 0.0
+        if not entry:
+            prices = api.last_price([instrument_id])
+            entry = float(prices[0]["price"]) if prices else 0.0
+        if not entry:
+            raise GuardRejection(
+                f"Нет текущей цены {ticker} — вероятно, вне торгов. "
+                f"Проверь quote перед заявкой."
+            )
+        checks = guards.check_trade_card(
+            entry=entry,
+            stop=float(card["stop"]),
+            target=float(card["target"]),
+            lots=lots,
+            lot_size=lot_size,
+            ticker=ticker,
+            atr=_atr_15m(instrument_id, ticker),
+        )
+        checks["entry"] = round(entry, 4)
 
     limits = api.max_lots(instrument_id, price)
-    info = api.find_instrument(instrument_id, limit=1)
-    ticker = info[0]["ticker"] if info else instrument_id[:8]
-    figi = info[0]["figi"] if info else ""
-
-    if direction == "ORDER_DIRECTION_BUY":
-        guards.check_buy(lots, limits, ticker)
+    if buying:
+        guards.check_buy(lots, limits, ticker, market)
     else:
         guards.check_sell(lots, limits, ticker)
 
-    result = api.post_order(instrument_id, lots, direction, price)
+    # Намерение записывается ДО сети: ключ идемпотентности должен пережить
+    # потерю ответа, иначе повтор создаст вторую заявку.
+    request_id = str(uuid.uuid4())
+    journal.create_intent(
+        {
+            "request_id": request_id,
+            "instrument_id": instrument_id,
+            "ticker": ticker,
+            "direction": "buy" if buying else "sell",
+            "order_type": "market" if market else "limit",
+            "lots": lots,
+            "price": price,
+            "card": {**(card or {}), **checks} if buying else None,
+        }
+    )
+
+    try:
+        result = api.post_order(instrument_id, lots, direction, price, order_id=request_id)
+    except TInvestError as exc:
+        # Брокер отказал явно — заявки нет, ключ можно закрыть.
+        journal.set_intent_state(request_id, "rejected", str(exc))
+        raise
+    except Exception as exc:  # noqa: BLE001 — сеть: судьба заявки неизвестна
+        journal.set_intent_state(request_id, "ambiguous", str(exc))
+        raise GuardRejection(
+            f"Связь с брокером оборвалась ({type(exc).__name__}). Заявка могла "
+            f"быть принята — её идентификатор {request_id}. Не повторяй вслепую: "
+            f"посмотри active_orders и operations."
+        ) from exc
+
+    journal.set_intent_state(request_id, "sent", result.get("status", ""))
     journal.log_order(
         {
             "order_id": result["order_id"],
+            "request_id": request_id,
             "instrument_id": instrument_id,
             "figi": figi,
             "ticker": ticker,
-            "direction": "buy" if direction.endswith("BUY") else "sell",
+            "direction": "buy" if buying else "sell",
             "order_type": "limit" if price is not None else "market",
             "lots": lots,
             "lots_executed": result["lots_executed"],
             "price": result["price"],
+            "requested_price": price,
             "total": result["total"],
             "status": result["status"],
+            "card": {**(card or {}), **checks} if buying else None,
             "raw": result["raw"],
         },
         rationale=rationale,
     )
+    if checks:
+        result["checks"] = checks
     return result
 
 
@@ -437,31 +592,68 @@ def tool_max_lots(instrument_id: str, price: float | None = None) -> dict:
 @tool(
     "buy",
     "Купить. Без price — по рынку, с price — лимитная заявка. Количество "
-    "в ЛОТАХ, не в штуках. Обоснование обязательно и попадает в журнал "
-    "рядом со сделкой. Покупка на сумму больше свободных денег отклоняется: "
-    "плечо запрещено.",
+    "в ЛОТАХ, не в штуках.\n"
+    "Вход требует карточки сделки: стоп, цель, плейбук, базовая ставка. "
+    "Это не бюрократия — по этим числам шлюз считает три барьера и режет "
+    "сделки, убыточные арифметически до всякого рынка: соотношение "
+    "прибыль/риск ниже 2, цель меньше десяти круговых комиссий, стоп внутри "
+    "шума (ближе 1.5 ATR). Размер позиции тоже считается от стопа, а не от "
+    "свободных денег: риск на идею не больше 1000 ₽.\n"
+    "Барьер нельзя обойти, изменив числа задним числом: карточка попадает в "
+    "журнал вместе с заявкой.",
     _obj(
         {
             "instrument_id": {"type": "string"},
             "lots": {"type": "integer"},
             "price": {"type": "number", "description": "цена лимитной заявки"},
+            "stop": {
+                "type": "number",
+                "description": "цена, ниже которой тезис опровергнут и ты выходишь",
+            },
+            "target": {"type": "number", "description": "первая цель по цене"},
+            "playbook": {
+                "type": "string",
+                "description": "класс сетапа из notes/playbooks.md",
+            },
+            "base_rate": {
+                "type": "string",
+                "description": "как часто этот сетап срабатывал и на чём измерено",
+            },
             "rationale": {
                 "type": "string",
-                "description": "почему покупаешь: тезис, ожидание, что опровергнет",
+                "description": "тезис: что должно произойти и почему рынок этого ещё не учёл",
             },
         },
-        ["instrument_id", "lots", "rationale"],
+        ["instrument_id", "lots", "stop", "target", "playbook", "base_rate", "rationale"],
     ),
 )
-def tool_buy(instrument_id: str, lots: int, rationale: str, price: float | None = None) -> dict:
-    return _order("ORDER_DIRECTION_BUY", instrument_id, lots, price, rationale)
+def tool_buy(
+    instrument_id: str,
+    lots: int,
+    stop: float,
+    target: float,
+    playbook: str,
+    base_rate: str,
+    rationale: str,
+    price: float | None = None,
+) -> dict:
+    if not str(playbook).strip() or not str(base_rate).strip():
+        raise ValueError("playbook и base_rate обязательны и не могут быть пустыми")
+    card = {
+        "stop": float(stop),
+        "target": float(target),
+        "playbook": str(playbook)[:80],
+        "base_rate": str(base_rate)[:400],
+    }
+    return _order("ORDER_DIRECTION_BUY", instrument_id, lots, price, rationale, card)
 
 
 @tool(
     "sell",
     "Продать. Без price — по рынку, с price — лимитная заявка. Количество "
     "в ЛОТАХ. Обоснование обязательно. Продажа сверх позиции отклоняется: "
-    "шорт запрещён.",
+    "шорт запрещён. Выход не ограничен ни дневным стопом, ни остановкой "
+    "прогона — избавиться от риска можно всегда.",
     _obj(
         {
             "instrument_id": {"type": "string"},
@@ -469,7 +661,7 @@ def tool_buy(instrument_id: str, lots: int, rationale: str, price: float | None 
             "price": {"type": "number"},
             "rationale": {
                 "type": "string",
-                "description": "почему продаёшь: сработал тезис, стоп, ребалансировка",
+                "description": "почему продаёшь: сработал тезис, стоп, истёк срок идеи",
             },
         },
         ["instrument_id", "lots", "rationale"],
@@ -499,14 +691,17 @@ def tool_cancel_order(order_id: str) -> dict:
     _obj({"days": {"type": "integer"}}),
 )
 def tool_operations(days: int = 7) -> list[dict]:
-    return client().operations(days)
+    return client().operations(max(1, min(int(days), 90)))
 
 
 @tool(
     "web_search",
     "Поиск в интернете с открытием страниц. Возвращает текст и ссылки на "
-    "источники. Один запрос стоит десятки тысяч токенов на стороне поиска — "
-    "формулируй конкретно, а не 'что нового на рынке'.",
+    "источники. В контекст ложится немного (около тысячи токенов), но на "
+    "стороне провайдера запрос стоит десятки тысяч и тратит квоту аккаунта. "
+    "Формулируй конкретно. Если проверяешь, вышел ли документ, ставь "
+    "watch_url на страницу раскрытия: за первый прогон один и тот же вопрос "
+    "про отчёт был задан поиском тринадцать раз за шесть часов.",
     _obj({"query": {"type": "string"}}, ["query"]),
 )
 def tool_web_search(query: str) -> dict:
@@ -515,10 +710,13 @@ def tool_web_search(query: str) -> dict:
 
 @tool(
     "schedule_wakeup",
-    "Назначить себе следующее пробуждение. Время: '+30m', '+2h' или "
+    "Назначить себе пробуждение. Время: '+30m', '+2h' или "
     "'2026-08-24T16:45' по Москве. Причина попадёт в текст пробуждения — "
     "пиши так, чтобы будущий ты понял, зачем проснулся. "
-    "Активный будильник ровно один: новый вызов заменяет предыдущий.",
+    "Одновременно можно держать до пяти будильников. "
+    "Будильник — для событий по расписанию (публикация, открытие торгов). "
+    "Следить за ценой им не надо: для этого есть watch, который не тратит "
+    "ни одного токена, пока условие не сработало.",
     _obj(
         {
             "at": {"type": "string", "description": "'+45m' или '2026-08-24T16:45'"},
@@ -531,13 +729,127 @@ def tool_schedule_wakeup(at: str, reason: str) -> dict:
     due = _parse_when(at)
     if due < time.time():
         raise ValueError("время пробуждения в прошлом")
-    wakeup_id = journal.schedule_wakeup(due, reason)
+    if not str(reason).strip():
+        raise ValueError("причина обязательна")
+    wakeup_id = journal.schedule_wakeup(due, str(reason)[:400])
     return {
         "id": wakeup_id,
         "at_msk": datetime.fromtimestamp(due, MSK).strftime("%Y-%m-%d %H:%M"),
         "in_minutes": round((due - time.time()) / 60, 1),
         "reason": reason,
     }
+
+
+@tool("wakeups", "Активные будильники.", _obj({}))
+def tool_wakeups() -> list[dict]:
+    return [
+        {
+            "id": row["id"],
+            "at_msk": datetime.fromtimestamp(row["due_ts"], MSK).strftime("%Y-%m-%d %H:%M"),
+            "in_minutes": round((row["due_ts"] - time.time()) / 60, 1),
+            "reason": row["reason"],
+        }
+        for row in journal.active_wakeups()
+    ]
+
+
+@tool(
+    "cancel_wakeup",
+    "Снять будильник, который больше не нужен.",
+    _obj({"id": {"type": "integer"}}, ["id"]),
+)
+def tool_cancel_wakeup(id: int) -> dict:  # noqa: A002 — имя поля схемы
+    return {"cancelled": journal.cancel_wakeup(int(id))}
+
+
+@tool(
+    "watch",
+    "Поставить условие на цену. Пока условие не выполнено, ты спишь и не "
+    "тратишь ни токена: цену раз в полминуты проверяет код одним батч-"
+    "запросом. Как только сработает — тебя разбудят с текущей ценой и твоей "
+    "заметкой.\n"
+    "Это основной способ следить за рынком. Просыпаться по будильнику, чтобы "
+    "посмотреть, дошла ли цена до уровня, не надо: за прошлый прогон таких "
+    "пробуждений было шестнадцать, и почти все закончились ничем.\n"
+    "Условие: price_above, price_below или pct_move (движение в процентах от "
+    "цены на момент постановки, в любую сторону).",
+    _obj(
+        {
+            "instrument_id": {"type": "string"},
+            "condition": {
+                "type": "string",
+                "description": "price_above | price_below | pct_move",
+            },
+            "value": {"type": "number", "description": "цена или проценты"},
+            "note": {
+                "type": "string",
+                "description": "что это значит и что делать при срабатывании",
+            },
+            "hours": {"type": "number", "description": "срок жизни, по умолчанию 8"},
+        },
+        ["instrument_id", "condition", "value", "note"],
+    ),
+)
+def tool_watch(
+    instrument_id: str, condition: str, value: float, note: str, hours: float = 8.0
+) -> dict:
+    if not str(note).strip():
+        raise ValueError("заметка обязательна: будущий ты должен понять, что сработало")
+    instrument = _resolve(instrument_id)
+    threshold = float(value)
+    if condition == "pct_move":
+        prices = client().last_price([instrument_id])
+        if not prices or not prices[0].get("price"):
+            raise ValueError("нет текущей цены, от которой считать движение")
+        base = float(prices[0]["price"])
+        threshold = abs(threshold)
+        note = f"{note} (от {base})"
+    hours = max(0.1, min(float(hours or 8), 72))
+    watch_id = journal.add_watch(
+        instrument_id,
+        instrument["ticker"],
+        condition,
+        threshold,
+        str(note)[:400],
+        time.time() + hours * 3600,
+    )
+    return {
+        "id": watch_id,
+        "ticker": instrument["ticker"],
+        "condition": condition,
+        "value": threshold,
+        "expires_msk": datetime.fromtimestamp(
+            time.time() + hours * 3600, MSK
+        ).strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+@tool("watches", "Активные условия наблюдения.", _obj({}))
+def tool_watches() -> list[dict]:
+    return [
+        {
+            "id": row["id"],
+            "ticker": row["ticker"],
+            "condition": row["kind"],
+            "value": row["threshold"],
+            "note": row["note"],
+            "expires_msk": datetime.fromtimestamp(row["expires_ts"], MSK).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            if row["expires_ts"]
+            else None,
+        }
+        for row in journal.active_watches()
+    ]
+
+
+@tool(
+    "unwatch",
+    "Снять условие наблюдения.",
+    _obj({"id": {"type": "integer"}}, ["id"]),
+)
+def tool_unwatch(id: int) -> dict:  # noqa: A002 — имя поля схемы
+    return {"cancelled": journal.cancel_watch(int(id))}
 
 
 @tool(
@@ -579,12 +891,28 @@ def tool_send_report(summary: str, path: str) -> dict:
         f"({result:+,.0f} ₽, {result / config.STARTING_CAPITAL * 100:+.2f}%)\n\n"
     ).replace(",", " ")
     sent_text = _telegram(header + summary)
-    sent_file = _telegram_document(path, f"Подробный отчёт за {datetime.now(MSK):%d.%m.%Y}")
+    # Отказ файла не должен терять уже отправленную выжимку и запись в журнале.
+    sent_file, file_error = False, ""
+    try:
+        sent_file = _telegram_document(
+            path, f"Подробный отчёт за {datetime.now(MSK):%d.%m.%Y}"
+        )
+    except (ValueError, OSError) as exc:
+        file_error = str(exc)
     journal.log_event(
         "daily_report",
-        {"summary": summary, "path": path, "text": sent_text, "file": sent_file},
+        {
+            "summary": summary,
+            "path": path,
+            "text": sent_text,
+            "file": sent_file,
+            "file_error": file_error,
+        },
     )
-    return {"text_delivered": sent_text, "file_delivered": sent_file}
+    result = {"text_delivered": sent_text, "file_delivered": sent_file}
+    if file_error:
+        result["file_error"] = file_error
+    return result
 
 
 # --- цикл JSON-RPC --------------------------------------------------------
