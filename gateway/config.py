@@ -8,9 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # Файлы с секретами. Codex не пробрасывает окружение в MCP-подпроцесс,
 # поэтому читаем сами.
 ENV_FILES = [
-    Path("/home/agent/.tinvest.env"),
-    Path("/home/agent/.omniroute.env"),
-    Path("/home/agent/.telegram.env"),
+    Path("/home/agent/.agent.env"),
     ROOT / ".env",
 ]
 
@@ -26,6 +24,12 @@ DB_PATH = os.environ.get("AGENT_DB", "/home/agent/state/agent.db")
 MAX_ORDERS_PER_HOUR = 30
 ALLOW_LEVERAGE = False
 ALLOW_SHORT = False
+
+# Порог остановки. Падение стоимости портфеля ниже — конец прогона:
+# торговля блокируется, супервизор перестаёт будить агента, дальше
+# нужно вмешательство человека. Снимается только вручную.
+CAPITAL_FLOOR = 30_000.0
+STARTING_CAPITAL = 100_000.0
 
 SEARCH_MODEL = "gpt-5.6-luna"
 SEARCH_TIMEOUT = 180
