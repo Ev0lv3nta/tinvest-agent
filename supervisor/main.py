@@ -296,6 +296,9 @@ class Supervisor:
         return kind, "", first("text", "message")
 
     _seen_methods: set = set()
+    # Полный текст рассуждений приходит потоком; в готовом элементе
+    # остаются только заголовки шагов, поэтому собираем сами по itemId.
+    _reasoning: dict = {}
 
     def tick_reconcile(self) -> None:
         interval = RECONCILE_INTERVAL_MARKET if market_open() else RECONCILE_INTERVAL_CLOSED
@@ -334,6 +337,17 @@ class Supervisor:
                 )
             elif method == "turn/started":
                 journal.log_transcript("turnStart", thread_id=thread_id, is_own=own)
+            elif method == "item/reasoning/summaryTextDelta" and own:
+                item_id = params.get("itemId") or ""
+                index = params.get("summaryIndex", 0)
+                chunk = params.get("delta") or ""
+                if item_id and chunk:
+                    parts = self._reasoning.setdefault(item_id, {})
+                    parts[index] = parts.get(index, "") + chunk
+                    journal.kv_set(
+                        "live_reasoning",
+                        "\n".join(parts[k] for k in sorted(parts))[-1200:],
+                    )
             elif method == "item/agentMessage/delta" and own:
                 # Поток ответа: копим текст, панель показывает его по мере
                 # появления. Без этого пауза в минуту выглядит как зависание.
@@ -355,6 +369,14 @@ class Supervisor:
             elif method == "item/completed":
                 item = params.get("item") or {}
                 kind, title, body = self._describe(item)
+                if kind == "reasoning":
+                    parts = self._reasoning.pop(item.get("id") or "", {})
+                    full = "\n".join(parts[k] for k in sorted(parts)).strip()
+                    # Собранный текст содержательнее заголовков, но если
+                    # поток не пришёл — оставляем что есть.
+                    if len(full) > len(body):
+                        body = full
+                    journal.kv_set("live_reasoning", "")
                 journal.log_transcript(
                     kind,
                     title=title,

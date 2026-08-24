@@ -96,10 +96,18 @@ main{padding:6px 18px 40px;max-width:760px;margin:0 auto}
   max-height:340px;overflow:auto}
 .out.hide{display:none}
 
-/* размышления */
-.think{margin:4px 0;font-size:13px;color:var(--faint);font-style:italic;
-  cursor:pointer;padding:3px 0}
-.think:hover{color:var(--muted)}
+/* размышления: шаги мысли, а не серая строчка */
+.think{margin:8px 0;padding-left:13px;border-left:1px solid var(--line)}
+.think .step{font-size:13px;color:var(--muted);font-style:italic;
+  padding:2px 0;line-height:1.5}
+.think .step::before{content:'';display:inline-block;width:4px;height:4px;
+  border-radius:50%;background:var(--faint);vertical-align:middle;
+  margin-right:8px;margin-top:-2px}
+.think .more{font-size:12px;color:var(--faint);cursor:pointer;padding:2px 0}
+.think .more:hover{color:var(--muted)}
+.think .rest{display:none}
+.think.full .rest{display:block}
+.think.full .more{display:none}
 
 /* субагент */
 .sub{border-left:2px solid var(--line);padding-left:13px;margin-left:2px}
@@ -134,6 +142,21 @@ main{padding:6px 18px 40px;max-width:760px;margin:0 auto}
 .pos-item{display:flex;justify-content:space-between;padding:9px 0;
   border-bottom:1px solid var(--line);font-size:14px}
 .pos-item .q{color:var(--muted);font-size:13px}
+
+/* ── квоты аккаунтов ───────────────────────────────────── */
+.quota{padding:13px 0;border-bottom:1px solid var(--line)}
+.quota .top{display:flex;align-items:baseline;gap:8px;font-size:13.5px}
+.quota .who{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.quota .plan{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.04em}
+.quota .pct{margin-left:auto;font-weight:600;font-variant-numeric:tabular-nums}
+.bar{height:5px;border-radius:3px;background:var(--line);margin:8px 0 6px;overflow:hidden}
+.bar i{display:block;height:100%;border-radius:3px;background:var(--accent);
+  transition:width .3s ease}
+.bar i.warn{background:#c9a15a}
+.bar i.hot{background:var(--neg)}
+.quota .sub{font-size:12.5px;color:var(--faint);display:flex;justify-content:space-between}
+.sect{font-size:11px;color:var(--faint);text-transform:uppercase;
+  letter-spacing:.06em;margin:24px 0 4px}
 
 /* ── живой ответ ───────────────────────────────────────── */
 .live{margin:16px 0 8px}
@@ -265,8 +288,16 @@ function render(it) {
   if (it.kind === 'userMessage')
     return `<div class="ev op"><div class="who">Оператор</div><div class="txt">${esc(it.body.replace(/^(Служебное|Сообщение от оператора):\s*/, ''))}</div></div>`;
 
-  if (it.kind === 'reasoning')
-    return `<div class="ev think${sub}" onclick="this.classList.toggle('full')">${esc(it.body.replace(/\*\*/g, '').slice(0, 160))}</div>`;
+  if (it.kind === 'reasoning') {
+    const steps = (it.body || '').split('\n').map(x => x.replace(/\*\*/g, '').trim()).filter(Boolean);
+    if (!steps.length) return '';
+    const head = steps.slice(0, 3), rest = steps.slice(3);
+    return `<div class="ev think${sub}">
+      ${head.map(x => `<div class="step">${esc(x)}</div>`).join('')}
+      ${rest.length ? `<div class="rest">${rest.map(x => `<div class="step">${esc(x)}</div>`).join('')}</div>
+        <div class="more" onclick="this.closest('.think').classList.add('full')">ещё ${rest.length}</div>` : ''}
+    </div>`;
+  }
 
   if (it.kind === 'error')
     return `<div class="ev err">${esc(it.body)}</div>`;
@@ -377,8 +408,29 @@ function sparkline(points, start) {
     <path d="${line}"/></svg>`;
 }
 
+function quotas(l) {
+  if (!l || !l.accounts?.length) return l?.error
+    ? `<div class="sect">Квоты</div><div class="empty">${esc(l.error)}</div>` : '';
+  let used = 0, cap = 0;
+  const rows = l.accounts.map(a => {
+    used += a.used; cap += a.total;
+    const cls = a.percent >= 85 ? 'hot' : a.percent >= 60 ? 'warn' : '';
+    return `<div class="quota">
+      <div class="top"><span class="who">${esc(a.id)}</span>
+        <span class="plan">${esc(a.plan)}</span>
+        <span class="pct">${a.percent.toFixed(0)}%</span></div>
+      <div class="bar"><i class="${cls}" style="width:${Math.min(100, a.percent)}%"></i></div>
+      <div class="sub"><span>${a.used} из ${a.total} · осталось ${a.remaining}</span>
+        <span>${esc(a.reset_human || '')}</span></div>
+    </div>`;
+  }).join('');
+  const total = cap ? `<div class="row"><span>Суммарно</span><span>${used} из ${cap} · ${(used / cap * 100).toFixed(0)}%</span></div>` : '';
+  return `<div class="sect">Квоты аккаунтов</div>${rows}<div class="rows">${total}</div>`;
+}
+
 async function stats() {
-  const [s, e] = await Promise.all([api('/api/state'), api('/api/equity')]);
+  const [s, e, l] = await Promise.all([
+    api('/api/state'), api('/api/equity'), api('/api/limits').catch(() => null)]);
   const pos = s.positions || [];
   main.innerHTML = sparkline(e.points, s.start) + `
     <div class="rows">
@@ -390,6 +442,8 @@ async function stats() {
       <div class="row"><span>Порог остановки</span><span>${money(s.floor)}</span></div>
       <div class="row"><span>Сделок</span><span>${s.trades}</span></div>
     </div>
+    ${quotas(l)}
+    <div class="sect">Позиции</div>
     ${pos.length ? '<div class="rows">' + pos.map(p => `
       <div class="pos-item"><span>${esc(p.ticker || '?')}<br><span class="q">${p.lots || 0} лот · ${(p.current_price || 0).toFixed(2)} ₽</span></span>
       <span class="${(p.yield || 0) >= 0 ? 'pos' : 'neg'}">${signed(p.yield || 0)} ₽</span></div>`).join('') + '</div>'
@@ -470,6 +524,10 @@ function live(l) {
   const [act, arg] = (l.activity || (l.text ? 'отвечает' : 'работает')).split(/:\s*/);
   el.innerHTML =
     `<div class="doing"><span class="pulse"></span><b>${esc(act)}</b>${arg ? `<span class="q">${esc(arg)}</span>` : ''}</div>` +
+    (l.reasoning && !l.text
+      ? `<div class="think" style="margin-top:8px;border-left-color:var(--line)">
+           <div class="step">${esc(l.reasoning.replace(/\*\*/g, '').split('\n').slice(-4).join('\n'))}</div></div>`
+      : '') +
     (l.text ? `<div class="streamed">${esc(l.text)}</div>` : '');
   if (pinned) scrollDown();
 }

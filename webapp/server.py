@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from gateway import config
+from gateway import config, limits
 
 MSK = ZoneInfo("Europe/Moscow")
 STATIC = Path(__file__).resolve().parent
@@ -178,8 +178,16 @@ class Handler(BaseHTTPRequestHandler):
             "state": kv("agent_state", "неизвестно"),
             "activity": kv("live_activity"),
             "text": kv("live_text"),
+            "reasoning": kv("live_reasoning"),
             "queued": pending,
         }
+
+    def api_limits(self, query: dict) -> dict:
+        force = query.get("force", ["0"])[0] in ("1", "true")
+        try:
+            return limits.fetch(force=force)
+        except limits.LimitsError as exc:
+            return {"accounts": [], "error": str(exc)}
 
     def api_trades(self) -> dict:
         conn = db()
@@ -228,6 +236,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(self.api_equity())
                 if path == "/api/live":
                     return self._json(self.api_live())
+                if path == "/api/limits":
+                    return self._json(self.api_limits(query))
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": str(exc)}, 500)
             return self._json({"error": "нет такого метода"}, 404)

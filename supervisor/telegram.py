@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
-from gateway import config, journal
+from gateway import config, journal, limits
 
 MSK = ZoneInfo("Europe/Moscow")
 API = "https://api.telegram.org/bot{token}/{method}"
@@ -26,13 +26,15 @@ BTN_RESULT = "📈 Итог"
 BTN_TRADES = "📝 Сделки"
 BTN_STATUS = "🧠 Статус"
 BTN_REPORT = "📄 Отчёт"
+BTN_LIMITS = "⚡ Лимиты"
 BTN_HALT = "⏸ Стоп"
 
 KEYBOARD = {
     "keyboard": [
         [{"text": BTN_PORTFOLIO}, {"text": BTN_RESULT}],
         [{"text": BTN_TRADES}, {"text": BTN_STATUS}],
-        [{"text": BTN_REPORT}, {"text": BTN_HALT}],
+        [{"text": BTN_REPORT}, {"text": BTN_LIMITS}],
+        [{"text": BTN_HALT}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -98,6 +100,7 @@ class Bot:
                     {"command": "portfolio", "description": "состояние портфеля"},
                     {"command": "trades", "description": "последние сделки"},
                     {"command": "status", "description": "чем занят агент"},
+                    {"command": "limits", "description": "квоты аккаунтов"},
                     {"command": "halt", "description": "остановить торговлю"},
                     {"command": "resume", "description": "снять остановку"},
                 ]
@@ -169,6 +172,39 @@ class Bot:
             )
             if row["rationale"]:
                 lines.append(f"<i>{row['rationale'][:300]}</i>")
+        return "\n".join(lines)
+
+    def render_limits(self, force: bool = False) -> str:
+        try:
+            data = limits.fetch(force=force)
+        except limits.LimitsError as exc:
+            return f"Не удалось получить квоты: {exc}"
+        if not data["accounts"]:
+            return "Аккаунтов не найдено."
+
+        lines = ["<b>Квоты аккаунтов</b>"]
+        total_used = total_cap = 0
+        for account in data["accounts"]:
+            filled = round(account["percent"] / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            lines.append(
+                f"\n<code>{account['id']}</code> · {account['plan']}"
+                f"\n{bar} <b>{account['percent']:.0f}%</b>"
+                f"\n{account['used']} из {account['total']} · осталось {account['remaining']}"
+            )
+            reset = limits.reset_in(account["reset_at"])
+            if reset:
+                lines.append(f"сброс {reset}")
+            total_used += account["used"]
+            total_cap += account["total"]
+
+        if total_cap:
+            lines.append(
+                f"\n<b>Суммарно:</b> {total_used} из {total_cap} "
+                f"({total_used / total_cap * 100:.0f}%)"
+            )
+        if data["age"]:
+            lines.append(f"<i>данные {data['age']} с назад</i>")
         return "\n".join(lines)
 
     def render_status(self) -> str:
@@ -256,6 +292,10 @@ class Bot:
             self.send(self.render_status())
         elif command in (BTN_REPORT, "/report"):
             self.send(self.render_last_report())
+        elif command in (BTN_LIMITS, "/limits"):
+            # По кнопке обновляем принудительно: смотрят её тогда, когда
+            # хотят знать положение дел сейчас, а не пять минут назад.
+            self.send(self.render_limits(force=True))
         elif command in (BTN_HALT, "/halt"):
             journal.kv_set("halted", "остановлено оператором из Telegram")
             journal.log_event("halt", {"reason": "оператор"})
