@@ -163,6 +163,7 @@ MIGRATIONS = [
     ("orders", "requested_price", "REAL"),
     ("orders", "card", "TEXT"),
     ("orders", "closed_ts", "REAL"),
+    ("watches", "base_price", "REAL"),
 ]
 
 
@@ -637,7 +638,13 @@ WATCH_KINDS = ("price_above", "price_below", "pct_move")
 
 
 def add_watch(
-    instrument_id: str, ticker: str, kind: str, threshold: float, note: str, expires_ts: float
+    instrument_id: str,
+    ticker: str,
+    kind: str,
+    threshold: float,
+    note: str,
+    expires_ts: float,
+    base_price: Optional[float] = None,
 ) -> int:
     if kind not in WATCH_KINDS:
         raise ValueError(f"условие должно быть одним из {', '.join(WATCH_KINDS)}")
@@ -649,8 +656,11 @@ def add_watch(
         raise ValueError(f"уже {active} наблюдателей при лимите {MAX_ACTIVE_WATCHES}")
     cursor = conn.execute(
         "INSERT INTO watches (created_ts, instrument_id, ticker, kind, threshold, note,"
-        " expires_ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (time.time(), instrument_id, ticker, kind, float(threshold), note, expires_ts),
+        " expires_ts, base_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            time.time(), instrument_id, ticker, kind, float(threshold), note,
+            expires_ts, base_price,
+        ),
     )
     conn.commit()
     return int(cursor.lastrowid)

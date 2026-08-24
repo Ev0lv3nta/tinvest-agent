@@ -15,6 +15,11 @@ class JournalCase(unittest.TestCase):
     """База очищается перед каждым тестом, схема остаётся."""
 
     def setUp(self) -> None:
+        # Справочник инструментов живёт файлом и переживал бы тесты, делая
+        # результат зависимым от их порядка.
+        from gateway import marketdata
+
+        marketdata.save_universe({})
         conn = journal.connect()
         for table in (
             "tool_calls", "orders", "snapshots", "wakeups", "events",
@@ -35,6 +40,7 @@ def add_order(**kwargs) -> None:
         "ts": kwargs.get("ts", 0.0),
         "order_id": kwargs.get("order_id", "x"),
         "instrument_id": kwargs.get("instrument_id", "uid"),
+        "figi": kwargs.get("figi", ""),
         "direction": kwargs.get("direction", "buy"),
         "order_type": "market",
         "lots": kwargs.get("lots", 1),
@@ -42,8 +48,8 @@ def add_order(**kwargs) -> None:
         "price": kwargs.get("price", 100.0),
     }
     conn.execute(
-        "INSERT INTO orders (ts, order_id, instrument_id, direction, order_type,"
-        " lots, lots_executed, price) VALUES (:ts, :order_id, :instrument_id,"
+        "INSERT INTO orders (ts, order_id, instrument_id, figi, direction, order_type,"
+        " lots, lots_executed, price) VALUES (:ts, :order_id, :instrument_id, :figi,"
         " :direction, :order_type, :lots, :lots_executed, :price)",
         row,
     )

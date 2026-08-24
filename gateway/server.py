@@ -797,13 +797,13 @@ def tool_watch(
         raise ValueError("заметка обязательна: будущий ты должен понять, что сработало")
     instrument = _resolve(instrument_id)
     threshold = float(value)
+    base = None
     if condition == "pct_move":
         prices = client().last_price([instrument_id])
         if not prices or not prices[0].get("price"):
             raise ValueError("нет текущей цены, от которой считать движение")
         base = float(prices[0]["price"])
         threshold = abs(threshold)
-        note = f"{note} (от {base})"
     hours = max(0.1, min(float(hours or 8), 72))
     watch_id = journal.add_watch(
         instrument_id,
@@ -812,12 +812,14 @@ def tool_watch(
         threshold,
         str(note)[:400],
         time.time() + hours * 3600,
+        base_price=base,
     )
     return {
         "id": watch_id,
         "ticker": instrument["ticker"],
         "condition": condition,
         "value": threshold,
+        "base_price": base,
         "expires_msk": datetime.fromtimestamp(
             time.time() + hours * 3600, MSK
         ).strftime("%Y-%m-%d %H:%M"),
