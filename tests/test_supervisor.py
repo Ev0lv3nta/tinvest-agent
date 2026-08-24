@@ -320,3 +320,61 @@ class UrlWatches(JournalCase):
         a = md._SPACE.sub(" ", md._MARKUP.sub(" ", md._TAGS.sub(" ", "<div>Отчёт <b>вышел</b></div>")))
         b = md._SPACE.sub(" ", md._MARKUP.sub(" ", md._TAGS.sub(" ", "<p>Отчёт  <i>вышел</i></p><script>x=1</script>")))
         self.assertEqual(a.strip(), b.strip())
+
+
+class McpStatus(JournalCase):
+    def setUp(self):
+        super().setUp()
+        self.supervisor = supervisor_main.Supervisor.__new__(supervisor_main.Supervisor)
+        self.supervisor.bot = FakeBot()
+
+    def test_промежуточный_статус_молчит(self):
+        for status in ("starting", "connecting", "connected", "ready"):
+            self.supervisor._mcp_status({"name": "trading", "status": status})
+        self.assertEqual(self.supervisor.bot.sent, [])
+
+    def test_отказ_сообщается_один_раз(self):
+        params = {"name": "trading", "status": "failed", "failureReason": "PYTHONPATH пуст"}
+        self.supervisor._mcp_status(params)
+        self.supervisor._mcp_status(params)
+        self.assertEqual(len(self.supervisor.bot.sent), 1)
+        self.assertIn("не поднялся", self.supervisor.bot.sent[0])
+
+    def test_восстановление_сообщается(self):
+        self.supervisor._mcp_status({"name": "trading", "status": "failed", "error": "x"})
+        self.supervisor._mcp_status({"name": "trading", "status": "connected"})
+        self.assertIn("поднялся", self.supervisor.bot.sent[-1])
+
+    def test_отказ_виден_агенту_в_блоке_состояния(self):
+        self.supervisor._mcp_status(
+            {"name": "trading", "status": "failed", "failureReason": "нет модуля"}
+        )
+        self.supervisor.last_activity = time.time()
+        block = self.supervisor.state_block()
+        self.assertIn("Торговые инструменты недоступны", block)
+
+
+class Usage(JournalCase):
+    def setUp(self):
+        super().setUp()
+        self.supervisor = supervisor_main.Supervisor.__new__(supervisor_main.Supervisor)
+
+    def test_расход_читается_из_своего_события(self):
+        self.supervisor._record_usage(
+            {
+                "turnId": "t1",
+                "tokenUsage": {
+                    "inputTokens": 120000, "outputTokens": 3000, "totalTokens": 123000,
+                    "contextUsedTokens": 78000, "contextWindow": 200000,
+                },
+            }
+        )
+        stats = journal.usage_since(3600)
+        self.assertEqual(stats["total"], 123000)
+        self.assertEqual(stats["context_used"], 78000)
+
+    def test_чужая_форма_не_ломает(self):
+        self.supervisor._record_usage({"turnId": "t2", "tokenUsage": {"unknown": 1}})
+        self.supervisor._record_usage({"turnId": "t3"})
+        self.supervisor._record_usage({"turnId": "t4", "tokenUsage": "строка"})
+        self.assertEqual(journal.usage_since(3600)["turns"], 2)

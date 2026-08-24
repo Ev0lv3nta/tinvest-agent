@@ -18,12 +18,11 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from gateway import config, journal
+from gateway import config, journal, limits
 from supervisor import reconcile
-from gateway import limits
 from supervisor.appserver import AppServer, AppServerError, Busy
-from supervisor.watcher import Watcher
 from supervisor.telegram import Bot
+from supervisor.watcher import Watcher
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -161,6 +160,7 @@ class Supervisor:
         self.last_check = time.time()
         self.last_report_date = journal.kv_get("last_report_date", "")
         self.last_reconcile = 0.0
+        self.last_deadman = 0.0
         self.watcher: Watcher | None = None
         # Экземплярные, а не классовые: изменяемые атрибуты класса — ловушка.
         self._seen_methods: set[str] = set()
@@ -310,6 +310,13 @@ class Supervisor:
         if quota:
             lines.append(quota)
 
+        failure = journal.kv_get("mcp_failed:trading", "")
+        if failure:
+            lines.append(
+                f"⚠️ Торговые инструменты недоступны ({failure[:120]}). "
+                f"Торговать нечем — сообщи оператору."
+            )
+
         return "\n".join(lines)
 
     @staticmethod
@@ -390,9 +397,15 @@ class Supervisor:
             return
         if self.deliver(self.wake_text("check"), "check"):
             self.last_check = time.time()
+        else:
+            # Не дошло (канал лёг или ход занят) — вернёмся через пару минут,
+            # а не на каждом проходе цикла.
+            self.last_check = time.time() - interval + RETRY_DELAY
 
     def tick_deadman(self) -> None:
         if time.time() - self.last_progress() < DEADMAN_TIMEOUT:
+            return
+        if time.time() - self.last_deadman < RETRY_DELAY:
             return
         # Будильник в далёком будущем не считается признаком жизни: раньше
         # повод на «+3 дня» глушил сторожок на трое суток.
@@ -401,8 +414,8 @@ class Supervisor:
             return
         if journal.active_watches() and market_open():
             return
+        self.last_deadman = time.time()
         self.deliver(self.wake_text("deadman"), "deadman")
-        self.last_delivery = time.time()
 
     def last_progress(self) -> float:
         """Признак жизни — входящее событие, а не наша доставка.
@@ -486,12 +499,20 @@ class Supervisor:
         name = params.get("name") or "?"
         status = str(params.get("status") or "")
         journal.kv_set(f"mcp_status:{name}", status)
-        if status.lower() in ("ok", "ready", "running", "started"):
+
+        # Отказом считаем только явный отказ: набор статусов у разных версий
+        # Codex отличается, и принимать промежуточный за поломку — значит
+        # будить оператора на каждом старте.
+        reason = params.get("failureReason") or params.get("error")
+        broken = bool(reason) or any(
+            word in status.lower() for word in ("fail", "error", "crash")
+        )
+        if not broken:
             if journal.kv_get(f"mcp_failed:{name}", ""):
                 journal.kv_set(f"mcp_failed:{name}", "")
                 self.bot.send(f"✅ MCP-сервер {name} поднялся.", keyboard=False)
             return
-        detail = str(params.get("failureReason") or params.get("error") or status)[:300]
+        detail = str(reason or status)[:300]
         journal.log_event("mcp_failed", {"name": name, "detail": detail})
         if journal.kv_get(f"mcp_failed:{name}", "") == detail:
             return
@@ -501,10 +522,6 @@ class Supervisor:
             f"Агент остался без торговых инструментов.",
             keyboard=False,
         )
-
-    def mcp_ready(self) -> bool:
-        failure = journal.kv_get("mcp_failed:trading", "")
-        return not failure
 
     def tick_inbox(self) -> None:
         """Очередь сообщений в базе. Пометка — только после доставки."""
