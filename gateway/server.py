@@ -16,12 +16,13 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from . import config, guards, journal, search
+from . import config, guards, journal, marketdata, search
 from .tinvest import SandboxClient, TInvestError
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -209,7 +210,8 @@ def tool_portfolio() -> dict:
     "выдачу занимают облигации — даже точный запрос 'SBER' вернёт бонды. "
     "Для акций всегда указывай kind='INSTRUMENT_TYPE_SHARE'. "
     "Названия в API отличаются от разговорных: акция Сбербанка называется "
-    "'Сбер Банк', поэтому запрос 'Сбербанк' слитно её не находит.",
+    "'Сбер Банк', поэтому запрос 'Сбербанк' слитно её не находит. "
+    "Найденные тикеры запоминаются на сутки — повторный поиск бесплатен.",
     _obj(
         {
             "query": {"type": "string", "description": "тикер или часть названия"},
@@ -223,36 +225,188 @@ def tool_portfolio() -> dict:
     ),
 )
 def tool_find_instrument(query: str, kind: str = "", limit: int = 10) -> list[dict]:
-    return client().find_instrument(query, limit=limit, kind=kind)
+    limit = max(1, min(int(limit or 10), 50))
+    cached = marketdata.resolve(query)
+    if cached and kind in ("", "INSTRUMENT_TYPE_SHARE"):
+        return [
+            {
+                "instrument_id": cached["uid"],
+                "figi": cached.get("figi", ""),
+                "ticker": query.upper(),
+                "name": cached.get("name", ""),
+                "lot": cached.get("lot", 1),
+                "cached": True,
+            }
+        ]
+    found = client().find_instrument(query, limit=limit, kind=kind)
+    for item in found[:1]:
+        marketdata.remember_instrument(item)
+    return found
 
 
 @tool(
     "quote",
-    "Последняя цена и статус торгов. Если статус не "
-    "SECURITY_TRADING_STATUS_NORMAL_TRADING, заявки будут отклонены с кодом 30079.",
-    _obj({"instrument_id": {"type": "string"}}, ["instrument_id"]),
+    "Последняя цена и статус торгов. Принимает список: цены на несколько "
+    "бумаг приходят одним запросом, поштучно спрашивать не надо. "
+    "Статус возвращается только для одиночного инструмента — если он не "
+    "SECURITY_TRADING_STATUS_NORMAL_TRADING, заявки отбиваются кодом 30079.",
+    _obj(
+        {
+            "instrument_id": {"type": "string"},
+            "instrument_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "до 50 идентификаторов за раз",
+            },
+        }
+    ),
 )
-def tool_quote(instrument_id: str) -> dict:
-    prices = client().last_price([instrument_id])
-    status = client().trading_status(instrument_id)
-    return {"price": prices[0]["price"] if prices else None, **status}
+def tool_quote(instrument_id: str = "", instrument_ids: list | None = None):
+    ids = [str(x) for x in (instrument_ids or []) if x]
+    if instrument_id:
+        ids.insert(0, instrument_id)
+    if not ids:
+        raise ValueError("нужен instrument_id или instrument_ids")
+    if len(ids) > 50:
+        raise ValueError("не больше 50 инструментов за вызов")
+
+    prices = client().last_price(ids)
+    if len(ids) == 1:
+        status = client().trading_status(ids[0])
+        found = prices[0] if prices else {}
+        return {
+            "price": found.get("price"),
+            "ticker": found.get("ticker"),
+            # Время биржи, а не наше: по нему видно, свежая котировка или
+            # висит с прошлой сессии.
+            "price_time": found.get("time"),
+            **status,
+        }
+    return {
+        "prices": {
+            item.get("ticker") or item.get("instrument_id"): item.get("price")
+            for item in prices
+        },
+        "time": prices[0].get("time") if prices else None,
+        "note": "статус торгов спрашивай отдельно по конкретной бумаге перед заявкой",
+    }
+
+
+@tool(
+    "market_snapshot",
+    "Широкий срез рынка одной таблицей: по каждой бумаге цена, движение к "
+    "вчерашнему закрытию и это же движение в дневных ATR. Стоит один "
+    "батч-запрос независимо от числа бумаг — рынок смотреть надо им, а не "
+    "перебором тикеров поштучно. Без аргументов берёт бумаги, которые уже "
+    "встречались в работе.",
+    _obj(
+        {
+            "tickers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "тикеры, например ['SBER','LKOH']; до 50",
+            }
+        }
+    ),
+)
+def tool_market_snapshot(tickers: list | None = None) -> dict:
+    api = client()
+    names = [str(t).upper() for t in (tickers or []) if t]
+    if not names:
+        names = sorted(marketdata.load_universe())
+    if not names:
+        raise ValueError("справочник пуст — передай список тикеров, дальше он запомнится")
+    names = names[:50]
+
+    resolved: dict[str, str] = {}
+    for ticker in names:
+        entry = marketdata.resolve(ticker)
+        if not entry:
+            found = api.find_instrument(ticker, limit=1, kind="INSTRUMENT_TYPE_SHARE")
+            if not found:
+                continue
+            marketdata.remember_instrument(found[0])
+            entry = marketdata.resolve(ticker)
+        if entry:
+            resolved[ticker] = entry["uid"]
+    if not resolved:
+        raise ValueError("ни один тикер не разрешился в инструмент")
+
+    prices = {
+        item.get("instrument_id"): item.get("price")
+        for item in api.last_price(list(resolved.values()))
+    }
+
+    rows = []
+    for ticker, uid in resolved.items():
+        last = prices.get(uid)
+        ref = marketdata.reference(api, ticker, uid)
+        previous = ref.get("prev_close") or 0.0
+        noise = ref.get("atr_day") or 0.0
+        change = (last - previous) if (last and previous) else 0.0
+        rows.append(
+            {
+                "ticker": ticker,
+                "last": last,
+                "chg_pct": round(change / previous * 100, 2) if previous else None,
+                # Движение, поделённое на обычный дневной размах: полпроцента
+                # у спокойной бумаги и у волатильной — разные события.
+                "atr_x": round(change / noise, 2) if noise else None,
+            }
+        )
+    rows.sort(key=lambda r: abs(r.get("atr_x") or 0), reverse=True)
+    return {
+        "as_of": datetime.now(MSK).strftime("%Y-%m-%d %H:%M"),
+        "instruments": len(rows),
+        "note": "chg_pct — к вчерашнему закрытию; atr_x — то же движение в дневных ATR",
+        "rows": rows,
+    }
 
 
 @tool(
     "candles",
-    "Исторические свечи. interval: CANDLE_INTERVAL_1_MIN, _5_MIN, _15_MIN, "
-    "_HOUR, _DAY, _WEEK, _MONTH.",
+    "Исторические свечи. Серия пишется в CSV на диск, в ответ идёт путь и "
+    "сводка: O/H/L/C, VWAP, ATR(14), диапазон открытия, положение цены в "
+    "диапазоне. Считай по файлу своим кодом — pandas читает его напрямую. "
+    "Сырую таблицу в контекст не тяни: минутные свечи за день это около "
+    "38 тысяч токенов, которые останутся в сессии до самого сжатия. "
+    "Повторный запрос за тот же интервал берёт файл с диска, не ходя в API. "
+    "interval: CANDLE_INTERVAL_1_MIN, _5_MIN, _15_MIN, _HOUR, _DAY, _WEEK.",
     _obj(
         {
             "instrument_id": {"type": "string"},
             "interval": {"type": "string"},
             "days": {"type": "integer", "description": "глубина в днях"},
+            "tail": {
+                "type": "integer",
+                "description": "сколько последних свечей вернуть строками, 0-50",
+            },
+            "refresh": {
+                "type": "boolean",
+                "description": "перекачать, не беря файл из кеша",
+            },
         },
         ["instrument_id", "interval", "days"],
     ),
 )
-def tool_candles(instrument_id: str, interval: str, days: int) -> list[dict]:
-    return client().candles(instrument_id, interval, days)
+def tool_candles(
+    instrument_id: str,
+    interval: str,
+    days: int,
+    tail: int = 0,
+    refresh: bool = False,
+) -> dict:
+    days = max(1, min(int(days), 1830))
+    tail = max(0, min(int(tail or 0), 50))
+    return marketdata.candles(
+        client(),
+        instrument_id,
+        interval,
+        days,
+        name=marketdata.ticker_for(instrument_id) or instrument_id,
+        tail=tail,
+        refresh=bool(refresh),
+    )
 
 
 @tool(
@@ -441,6 +595,29 @@ def _send(message: dict) -> None:
     sys.stdout.flush()
 
 
+def _render(tool: str, payload: Any) -> str:
+    """Текст ответа инструмента. Объёмное уезжает в файл, а не в контекст.
+
+    Отступов нет намеренно: `indent=2` добавляет к любому ответу около 40%
+    объёма и ничего не даёт модели. Потолок — последняя линия обороны: даже
+    инструмент, который завтра начнёт возвращать таблицу на тысячу строк, не
+    сможет высыпать её в сессию текстом.
+    """
+    if isinstance(payload, str):
+        text = payload
+    else:
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(text.encode("utf-8")) <= config.MAX_TOOL_RESULT_BYTES:
+        return text
+    try:
+        stub = marketdata.spill(tool, payload, text)
+    except OSError as exc:  # диск недоступен — лучше обрезать, чем потерять ответ
+        journal.log_event("spill_failed", {"tool": tool, "error": str(exc)[:200]})
+        return text[: config.MAX_TOOL_RESULT_BYTES] + "\n…обрезано"
+    journal.log_event("tool_spilled", {"tool": tool, "file": stub["file"]})
+    return json.dumps(stub, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
 def _call_tool(name: str, arguments: dict) -> tuple[bool, Any]:
     handler = HANDLERS.get(name)
     if handler is None:
@@ -499,10 +676,9 @@ def main() -> None:
             _send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}})
         elif method == "tools/call":
             params = request.get("params") or {}
-            ok, payload = _call_tool(params.get("name", ""), params.get("arguments") or {})
-            text = payload if isinstance(payload, str) else json.dumps(
-                payload, ensure_ascii=False, indent=2, default=str
-            )
+            name = params.get("name", "")
+            ok, payload = _call_tool(name, params.get("arguments") or {})
+            text = _render(name, payload)
             _send(
                 {
                     "jsonrpc": "2.0",
