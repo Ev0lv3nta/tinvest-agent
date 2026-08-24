@@ -141,8 +141,11 @@ class Supervisor:
             head = f"Сработал твой будильник. Ты просил разбудить: {reason}"
         elif kind == "check":
             head = (
-                "Регулярная проверка. Нужно ли что-то делать сейчас? "
-                "Если нет — поставь следующий будильник и заканчивай ход."
+                "Регулярная проверка. Оцени обстановку и реши, чем заняться. "
+                "Если торговать не время — это не повод заканчивать ход: "
+                "разбирайся в рынке, проверяй гипотезы, готовься к открытию. "
+                "Спать имеет смысл, когда картина есть и ты ждёшь конкретного "
+                "момента."
             )
         elif kind == "report":
             head = (
@@ -201,8 +204,12 @@ class Supervisor:
             method = event.get("method")
             params = event.get("params") or {}
 
-            if method == "turn/completed":
+            thread_id = params.get("threadId") or ""
+            own = not thread_id or thread_id == self.codex.thread_id
+
+            if method == "turn/completed" and own:
                 journal.kv_set("agent_state", "спит")
+                journal.kv_set("last_turn_end", str(time.time()))
                 self.last_activity = time.time()
                 journal.log_event("turn_completed", {"usage": params.get("usage") or {}})
             elif method == "item/completed":
@@ -211,7 +218,9 @@ class Supervisor:
                 kind = item.get("type")
                 if kind == "agentMessage":
                     text = (item.get("text") or "")[:4000]
-                    journal.log_event("agent_message", {"text": text})
+                    journal.log_event(
+                        "agent_message" if own else "subagent_message", {"text": text}
+                    )
                     self.last_activity = time.time()
                 elif kind == "error":
                     journal.log_event("item_error", {"message": str(item.get("message"))[:500]})
@@ -227,8 +236,14 @@ class Supervisor:
             try:
                 text = self.inbox.get_nowait()
             except queue.Empty:
-                return
+                break
             self.deliver(f"Сообщение от оператора: {text}", "operator")
+
+        # Очередь в базе: способ дотянуться до агента мимо Telegram, не трогая
+        # его расписание. Служебное сообщение не должно стирать будильник.
+        for row in journal.take_messages():
+            prefix = "Сообщение от оператора" if row["source"] == "operator" else "Служебное"
+            self.deliver(f"{prefix}: {row['text']}", row["source"])
 
     def tick_halt(self) -> bool:
         """True — прогон остановлен, будить агента больше не нужно."""

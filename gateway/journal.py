@@ -73,6 +73,15 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 
+CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         REAL    NOT NULL,
+    source     TEXT    NOT NULL,
+    text       TEXT    NOT NULL,
+    delivered  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_messages_undelivered ON messages(delivered, id);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -205,6 +214,30 @@ def mark_wakeup_fired(wakeup_id: int) -> None:
     conn = connect()
     conn.execute("UPDATE wakeups SET fired_ts = ? WHERE id = ?", (time.time(), wakeup_id))
     conn.commit()
+
+
+def enqueue_message(text: str, source: str = "operator") -> int:
+    """Сообщение агенту в обход будильников: расписание не трогаем."""
+    conn = connect()
+    cursor = conn.execute(
+        "INSERT INTO messages (ts, source, text) VALUES (?, ?, ?)",
+        (time.time(), source, text),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def take_messages(limit: int = 10) -> list[sqlite3.Row]:
+    conn = connect()
+    rows = conn.execute(
+        "SELECT * FROM messages WHERE delivered = 0 ORDER BY id LIMIT ?", (limit,)
+    ).fetchall()
+    if rows:
+        conn.executemany(
+            "UPDATE messages SET delivered = 1 WHERE id = ?", [(r["id"],) for r in rows]
+        )
+        conn.commit()
+    return rows
 
 
 def kv_get(key: str, default: Optional[str] = None) -> Optional[str]:

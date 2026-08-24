@@ -111,17 +111,28 @@ class AppServer:
                 journal.log_event("codex_stderr", {"line": line[:500]})
 
     def _track(self, message: dict) -> None:
-        """Состояние треда обновляется из потока нотификаций."""
+        """Состояние треда обновляется из потока нотификаций.
+
+        Субагенты работают в собственных тредах и присылают свои
+        turn/started и turn/completed. Без сверки threadId первый
+        завершившийся субагент сбрасывал состояние основного агента.
+        """
         method = message.get("method")
         params = message.get("params") or {}
+        thread_id = params.get("threadId") or (params.get("thread") or {}).get("id", "")
+
+        if method == "thread/started" and not self.thread_id:
+            self.thread_id = thread_id
+            return
+        if thread_id and self.thread_id and thread_id != self.thread_id:
+            return  # событие субагента, состояние основного не трогаем
+
         if method == "turn/started":
-            self.turn_id = params.get("turnId") or params.get("turn", {}).get("id", "")
+            self.turn_id = params.get("turnId") or (params.get("turn") or {}).get("id", "")
             self.busy = True
         elif method == "turn/completed":
             self.busy = False
             self.turn_id = ""
-        elif method == "thread/started":
-            self.thread_id = params.get("threadId") or params.get("thread", {}).get("id", "")
 
     def request(self, method: str, params: dict, timeout: int = 120) -> dict:
         if not self.alive():

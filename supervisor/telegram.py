@@ -173,25 +173,53 @@ class Bot:
 
     def render_status(self) -> str:
         conn = journal.connect()
-        pending = journal.pending_wakeup()
+        state = journal.kv_get("agent_state", "неизвестно")
+        icon = "🟢" if state == "работает" else "😴"
+        lines = [f"{icon} <b>Статус</b>: {state}"]
+
         last_call = conn.execute(
             "SELECT tool, ts FROM tool_calls ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        state = journal.kv_get("agent_state", "неизвестно")
-        lines = [f"<b>Статус</b>: {state}"]
         if last_call:
-            lines.append(f"Последнее действие: {last_call['tool']}, {_ago(last_call['ts'])}")
+            when = datetime.fromtimestamp(last_call["ts"], MSK).strftime("%d.%m %H:%M:%S")
+            lines.append(f"Последнее действие: <b>{last_call['tool']}</b>")
+            lines.append(f"{when} ({_ago(last_call['ts'])})")
+
+        last_end = journal.kv_get("last_turn_end", "")
+        if last_end and state != "работает":
+            lines.append(f"Закончил ход: {_ago(float(last_end))}")
+
+        wake = conn.execute(
+            "SELECT * FROM events WHERE kind = 'wake' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if wake:
+            lines.append(f"Последнее пробуждение: {_ago(wake['ts'])}")
+
+        lines.append("")
+        pending = journal.pending_wakeup()
         if pending:
             when = datetime.fromtimestamp(pending["due_ts"], MSK).strftime("%d.%m %H:%M")
             minutes = (pending["due_ts"] - time.time()) / 60
-            lines.append(f"\nСледующее пробуждение: <b>{when}</b> (через {minutes:.0f} мин)")
-            lines.append(f"<i>{pending['reason']}</i>")
+            through = f"{minutes:.0f} мин" if minutes < 120 else f"{minutes / 60:.1f} ч"
+            lines.append(f"⏰ Следующее пробуждение: <b>{when}</b> (через {through})")
+            lines.append(f"<i>{pending['reason'][:400]}</i>")
         else:
-            lines.append("\nБудильник не назначен.")
-        calls = conn.execute(
+            lines.append("⏰ Будильник не назначен — разбужу сам по расписанию.")
+
+        calls_day = conn.execute(
             "SELECT COUNT(*) AS n FROM tool_calls WHERE ts > ?", (time.time() - 86400,)
         ).fetchone()["n"]
-        lines.append(f"\nВызовов инструментов за сутки: {calls}")
+        calls_hour = conn.execute(
+            "SELECT COUNT(*) AS n FROM tool_calls WHERE ts > ?", (time.time() - 3600,)
+        ).fetchone()["n"]
+        lines.append(f"\nВызовов инструментов: {calls_hour} за час, {calls_day} за сутки")
+
+        subagents = conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE kind = 'subagent_message' AND ts > ?",
+            (time.time() - 3600,),
+        ).fetchone()["n"]
+        if subagents:
+            lines.append(f"Отчётов субагентов за час: {subagents}")
         return "\n".join(lines)
 
     def render_last_report(self) -> str:
