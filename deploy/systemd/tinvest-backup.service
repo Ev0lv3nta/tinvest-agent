@@ -1,0 +1,14 @@
+[Unit]
+Description=Часовой снимок журнала агента в root-only каталог
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# Шлюз и Codex работают от одного пользователя, поэтому «агент не может
+# переписать журнал» верно на уровне процесса, но не на уровне ОС. Снимок
+# делает подделку обнаружимой: копия принадлежит root и агенту недоступна.
+ExecStart=/usr/bin/python3 /opt/tinvest-agent/deploy/backup_journal.py
+
+[Install]
+WantedBy=multi-user.target

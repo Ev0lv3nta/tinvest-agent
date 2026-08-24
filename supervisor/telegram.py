@@ -57,6 +57,25 @@ def _ago(ts: float) -> str:
     return f"{int(minutes // 1440)} дн назад"
 
 
+def _status(row) -> str:
+    """Понятный статус вместо кода API.
+
+    Неисполненная лимитка приходит с executedOrderPrice = 0 и статусом NEW —
+    в ленте она выглядела сделкой по нулевой цене.
+    """
+    status = str(row["status"] or "")
+    executed = row["lots_executed"] or 0
+    if "FILL" in status and executed >= (row["lots"] or 0):
+        return "исполнена"
+    if executed:
+        return f"исполнена частично ({executed} из {row['lots']})"
+    if "CANCELLED" in status:
+        return "снята"
+    if "REJECTED" in status:
+        return "отклонена"
+    return "выставлена"
+
+
 def _esc(value) -> str:
     """Экранирование для parse_mode=HTML.
 
@@ -167,7 +186,11 @@ class Bot:
         current = rows[-1]["total"]
         peak = max(r["total"] for r in rows)
         drawdown = (current / peak - 1) * 100 if peak else 0.0
-        trades = conn.execute("SELECT COUNT(*) AS n FROM orders").fetchone()["n"]
+        # Сделка — исполненная заявка. Отменённые лимитки сделками не были.
+        trades = conn.execute(
+            "SELECT COUNT(*) AS n FROM orders WHERE COALESCE(lots_executed,0) > 0"
+        ).fetchone()["n"]
+        submitted = conn.execute("SELECT COUNT(*) AS n FROM orders").fetchone()["n"]
         halted = journal.kv_get("halted", "")
         lines = [
             "<b>Итог</b>",
@@ -175,7 +198,7 @@ class Bot:
             f"К старту: {current - start:+,.0f} ₽ ({(current / start - 1) * 100:+.2f}%)".replace(",", " "),
             f"Максимум: {_money(peak)} ₽, просадка от него {drawdown:.2f}%",
             f"Порог остановки: {_money(config.CAPITAL_FLOOR)} ₽",
-            f"Сделок: {trades}",
+            f"Сделок: {trades}" + (f" (заявок {submitted})" if submitted > trades else ""),
         ]
         if halted:
             lines.append(f"\n⛔ <b>Остановлен:</b> {_esc(halted)}")
@@ -194,7 +217,8 @@ class Bot:
             side = "покупка" if row["direction"] == "buy" else "продажа"
             lines.append(
                 f"\n<b>{when}</b> · {side} {_esc(row['ticker'] or '?')} × {row['lots']} лот"
-                f"\n{_money(row['total'] or 0)} ₽ · {_esc(row['status'] or '?')}"
+                f"\n{_money(row['total'] or row['requested_price'] and row['requested_price'] * row['lots'] or 0)} ₽"
+                f" · {_esc(_status(row))}"
             )
             if row["rationale"]:
                 lines.append(f"<i>{_esc(row['rationale'][:300])}</i>")
@@ -265,6 +289,18 @@ class Bot:
             through = f"{minutes:.0f} мин" if minutes < 120 else f"{minutes / 60:.1f} ч"
             lines.append(f"⏰ Следующее пробуждение: <b>{when}</b> (через {through})")
             lines.append(f"<i>{_esc(pending['reason'][:400])}</i>")
+
+        watches = journal.active_watches()
+        if watches:
+            lines.append("\n👁 <b>Следит код</b>")
+            sign = {"price_above": "≥", "price_below": "≤", "pct_move": "движение"}
+            for row in watches[:6]:
+                what = row["ticker"] or (row["url"] or "")[:40]
+                lines.append(
+                    f"{_esc(what)} {sign.get(row['kind'], row['kind'])} "
+                    f"{row['threshold']:g}" if row["kind"] != "url_changed"
+                    else f"страница {_esc(what)}"
+                )
         else:
             lines.append("⏰ Будильник не назначен — разбужу сам по расписанию.")
 

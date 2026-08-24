@@ -49,12 +49,15 @@ fi
 install -D -o agent -g agent -m 600 "$REPO/deploy/codex-config.toml" \
     /home/agent/.codex/config.toml
 
-for unit in tinvest-agent tinvest-panel omniroute-tunnel; do
+for unit in tinvest-agent tinvest-panel omniroute-tunnel tinvest-backup; do
     install -D -m 644 "$REPO/deploy/systemd/$unit.service" \
         "/etc/systemd/system/$unit.service"
 done
+install -D -m 644 "$REPO/deploy/systemd/tinvest-backup.timer" \
+    /etc/systemd/system/tinvest-backup.timer
 systemctl daemon-reload
 systemctl enable omniroute-tunnel tinvest-panel tinvest-agent >/dev/null
+systemctl enable --now tinvest-backup.timer >/dev/null
 
 echo "Проверка перед запуском:"
 command -v codex >/dev/null && codex --version || echo "  codex не найден в PATH"
@@ -63,3 +66,4 @@ python3 -c "import sys; sys.path.insert(0,'$REPO'); from gateway import server; 
 python3 -m unittest discover -t "$REPO" -s "$REPO/tests" -q 2>&1 | tail -3
 
 echo "Готово. Запуск: systemctl start omniroute-tunnel tinvest-panel tinvest-agent"
+echo "Снимки журнала: /var/backups/tinvest-agent (root-only, раз в час)"
