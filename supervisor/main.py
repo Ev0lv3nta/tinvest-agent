@@ -137,12 +137,22 @@ class Supervisor:
         healthy, detail = omniroute_healthy()
         if not healthy:
             journal.log_event("wake_skipped", {"kind": kind, "reason": detail})
-            self.bot.send(
-                f"⚠️ Канал к модели недоступен ({detail}). "
-                f"Пробуждение «{kind}» пропущено, повторю позже.",
-                keyboard=False,
-            )
+            # Пока канал лежит, пробуждения сыплются одно за другим.
+            # Сообщаем о начале сбоя и потом не чаще раза в полчаса.
+            last = float(journal.kv_get("outage_notified", "0") or 0)
+            if time.time() - last > 1800:
+                journal.kv_set("outage_notified", str(time.time()))
+                self.bot.send(
+                    f"⚠️ <b>Канал к модели недоступен</b> ({detail})\n\n"
+                    f"Агент не может работать. Туннель OmniRoute поднимается на "
+                    f"стороне USA_hiphosting.\n\n"
+                    f"Когда появится новый адрес:\n"
+                    f"<code>python3 deploy/set_endpoint.py &lt;новый URL&gt;</code>"
+                )
             return
+        if journal.kv_get("outage_notified", ""):
+            journal.kv_set("outage_notified", "")
+            self.bot.send("✅ Канал к модели восстановлен, агент продолжает работу.")
         try:
             mode = self.codex.deliver(text)
             journal.log_event("wake", {"kind": kind, "mode": mode, "text": text[:400]})
