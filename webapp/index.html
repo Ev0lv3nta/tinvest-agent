@@ -142,6 +142,7 @@ main{padding:6px 18px 40px;max-width:760px;margin:0 auto}
 .chart .base{stroke:var(--line);stroke-width:1;stroke-dasharray:3 4}
 
 .empty{text-align:center;color:var(--faint);padding:56px 20px;font-size:14px}
+.note{color:var(--faint);padding:10px 2px;font-size:13px}
 .pos-item{display:flex;justify-content:space-between;padding:9px 0;
   border-bottom:1px solid var(--line);font-size:14px}
 .pos-item .q{color:var(--muted);font-size:13px}
@@ -236,6 +237,7 @@ const api = async (path, params = {}) => {
 
 const money = n => Math.round(n).toLocaleString('ru-RU') + ' ₽';
 const signed = n => (n >= 0 ? '+' : '−') + Math.abs(Math.round(n)).toLocaleString('ru-RU');
+const pct = (n, sign = false) => (n < 0 ? '−' : sign ? '+' : '') + Math.abs(n).toFixed(2) + '%';
 const clock = ts => new Date(ts * 1000).toLocaleTimeString('ru-RU',
   { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' });
 const day = ts => new Date(ts * 1000).toLocaleDateString('ru-RU',
@@ -256,7 +258,7 @@ function header(s) {
   const d = document.getElementById('delta');
   const cls = Math.abs(s.delta) < 1 ? 'flat' : s.delta > 0 ? 'pos' : 'neg';
   d.className = 'delta ' + cls;
-  d.textContent = `${signed(s.delta)} ₽ · ${s.delta >= 0 ? '+' : '−'}${Math.abs(s.delta_pct).toFixed(2)}%`;
+  d.textContent = `${signed(s.delta)} ₽ · ${pct(s.delta_pct, true)}`;
 
   const live = s.state === 'работает';
   document.getElementById('dot').className = 'dot' + (live ? ' live' : '');
@@ -415,7 +417,7 @@ function sparkline(points, start) {
 
 function quotas(l) {
   if (!l || !l.accounts?.length) return l?.error
-    ? `<div class="sect">Квоты</div><div class="empty">${esc(l.error)}</div>` : '';
+    ? `<div class="sect">Квоты</div><div class="note">${esc(l.error)}</div>` : '';
   let used = 0, cap = 0;
   const rows = l.accounts.map(a => {
     used += a.used; cap += a.total;
@@ -436,7 +438,7 @@ function quotas(l) {
 function budget(s) {
   if (!s.turns_24h && !s.tokens_24h) return '';
   const ctx = s.context_pct === null ? '' :
-    `<div class="row"><span>Контекст заполнен</span><span>${s.context_pct}%</span></div>`;
+    `<div class="row"><span>Контекст заполнен</span><span>${Math.round(s.context_pct)}%</span></div>`;
   const tok = s.tokens_24h
     ? `<div class="row"><span>Токенов</span><span>${(s.tokens_24h / 1000).toFixed(0)}k</span></div>` : '';
   return `<div class="sect">Расход за сутки</div><div class="rows">
@@ -461,8 +463,8 @@ async function stats() {
       <div class="row"><span>Сейчас</span><span>${money(s.total)}</span></div>
       <div class="row"><span>Свободные деньги</span><span>${money(s.cash)}</span></div>
       <div class="row"><span>Старт</span><span>${money(s.start)}</span></div>
-      <div class="row"><span>Результат</span><span class="${s.delta >= 0 ? 'pos' : 'neg'}">${signed(s.delta)} ₽ · ${s.delta_pct.toFixed(2)}%</span></div>
-      <div class="row"><span>Просадка от максимума</span><span>${s.drawdown_pct.toFixed(2)}%</span></div>
+      <div class="row"><span>Результат</span><span class="${s.delta >= 0 ? 'pos' : 'neg'}">${signed(s.delta)} ₽ · ${pct(s.delta_pct, true)}</span></div>
+      <div class="row"><span>Просадка от максимума</span><span>${pct(s.drawdown_pct)}</span></div>
       <div class="row"><span>Порог остановки</span><span>${money(s.floor)}</span></div>
       ${s.day_result === null ? '' : `<div class="row"><span>За сегодня</span><span class="${s.day_result >= 0 ? 'pos' : 'neg'}">${signed(s.day_result)} ₽ · лимит −${money(s.daily_loss_limit)}</span></div>`}
       <div class="row"><span>Сделок исполнено</span><span>${s.trades}${s.submissions > s.trades ? ` <span class="q">из ${s.submissions} заявок</span>` : ''}</span></div>
