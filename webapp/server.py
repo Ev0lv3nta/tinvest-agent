@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import hmac
 import json
 import sqlite3
@@ -164,6 +165,24 @@ class Handler(BaseHTTPRequestHandler):
         ]
         return {"items": items, "oldest": oldest}
 
+    # OmniRoute подмешивает в поток свои служебные строки, пока ждёт
+    # провайдера. К рассуждениям агента они отношения не имеют.
+    NOISE = re.compile(
+        r"(OmniRoute:\s*got request,?\s*sending to provider\.?\s*)+", re.IGNORECASE
+    )
+
+    @classmethod
+    def _clean_reasoning(cls, text: str) -> str:
+        text = cls.NOISE.sub("", text or "")
+        # Схлопываем подряд идущие одинаковые строки: поток иногда
+        # повторяет один и тот же фрагмент.
+        lines, out = text.splitlines(), []
+        for line in lines:
+            line = line.rstrip()
+            if line and (not out or out[-1] != line):
+                out.append(line)
+        return "\n".join(out).strip()
+
     def api_live(self) -> dict:
         conn = db()
 
@@ -178,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
             "state": kv("agent_state", "неизвестно"),
             "activity": kv("live_activity"),
             "text": kv("live_text"),
-            "reasoning": kv("live_reasoning"),
+            "reasoning": self._clean_reasoning(kv("live_reasoning")),
             "queued": pending,
         }
 

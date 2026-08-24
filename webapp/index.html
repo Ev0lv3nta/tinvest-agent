@@ -25,6 +25,7 @@ header{position:sticky;top:0;z-index:20;background:rgba(16,15,14,.96);
   backdrop-filter:blur(12px);border-bottom:1px solid var(--line);
   padding:10px 18px 0;transition:padding .18s ease}
 .sum{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+#quota2{align-self:center}
 .total{font-size:22px;font-weight:600;letter-spacing:-.02em;
   font-variant-numeric:tabular-nums;transition:font-size .18s ease}
 .delta{font-size:14px;font-weight:500;font-variant-numeric:tabular-nums}
@@ -43,6 +44,8 @@ header.slim nav button{padding:6px 0 7px;font-size:12.5px}
 header.slim .sum{gap:8px}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--faint);flex:none}
 #dot2{align-self:center}
+#quota{font-variant-numeric:tabular-nums}
+#quota.warn{color:var(--accent)} #quota.hot{color:var(--neg)}
 .dot.live{background:var(--pos);box-shadow:0 0 0 3px rgba(130,157,108,.16)}
 .sep{color:var(--line)}
 .halt{margin:10px 0 0;padding:9px 12px;border-radius:var(--radius);
@@ -193,11 +196,13 @@ main{padding:6px 18px 40px;max-width:760px;margin:0 auto}
   <div class="sum">
     <span class="total" id="total">—</span>
     <span class="delta" id="delta"></span>
-    <span class="dot" id="dot2" style="margin-left:auto"></span>
+    <span id="quota2" style="margin-left:auto;font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums"></span>
+    <span class="dot" id="dot2"></span>
   </div>
   <div class="meta">
     <span class="dot" id="dot"></span><span id="state">загрузка</span>
     <span class="sep">·</span><span id="wake"></span>
+    <span class="sep">·</span><span id="quota" title="квота аккаунтов"></span>
   </div>
   <div id="halt"></div>
   <nav>
@@ -548,7 +553,26 @@ async function tickNow() {
   loop(working ? 1200 : 3000);
 }
 
+let quotaAt = 0;
+async function quotaTick() {
+  if (Date.now() - quotaAt < 60000) return;
+  quotaAt = Date.now();
+  try {
+    const l = await api('/api/limits');
+    if (!l.accounts?.length) return;
+    const worst = Math.max(...l.accounts.map(a => a.percent));
+    const used = l.accounts.reduce((s, a) => s + a.used, 0);
+    const cap = l.accounts.reduce((s, a) => s + a.total, 0);
+    const cls = worst >= 85 ? 'hot' : worst >= 60 ? 'warn' : '';
+    const short = l.accounts.map(a => `${a.percent.toFixed(0)}%`).join(' / ');
+    document.getElementById('quota').className = cls;
+    document.getElementById('quota').textContent = `квота ${short}`;
+    document.getElementById('quota2').textContent = `${(used / cap * 100).toFixed(0)}%`;
+  } catch (e) {}
+}
+
 async function tick() {
+  quotaTick();
   try { header(await api('/api/state')); } catch (e) {}
   if (tab !== 'feed') return;
   try { live(await api('/api/live')); } catch (e) {}
