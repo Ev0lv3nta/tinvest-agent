@@ -76,6 +76,16 @@ SESSIONS = (
 )
 
 
+def _spaced(value: float, sign: bool = False) -> str:
+    """Число с разделёнными разрядами: 99 724, −276.
+
+    Обычный пробел, а не типографский: текст уходит в модель, и экзотические
+    символы там ни к чему.
+    """
+    text = f"{value:+,.0f}" if sign else f"{value:,.0f}"
+    return text.replace(",", " ").replace("-", "−")
+
+
 def now_msk() -> datetime:
     return datetime.now(MSK)
 
@@ -248,11 +258,9 @@ class Supervisor:
             total = float(snapshot["total"])
             start = config.STARTING_CAPITAL
             day = journal.day_result(total)
-            piece = (
-                f"Портфель {total:,.0f} ₽ ({total - start:+,.0f} к старту"
-            ).replace(",", " ")
+            piece = f"Портфель {_spaced(total)} ₽ ({_spaced(total - start, sign=True)} к старту"
             if day is not None:
-                piece += f", {day:+,.0f} за сегодня".replace(",", " ")
+                piece += f", {_spaced(day, sign=True)} за сегодня"
             lines.append(piece + ")")
             positions = json.loads(snapshot["positions"] or "[]")
             if positions:
@@ -292,7 +300,7 @@ class Supervisor:
         if usage["turns"]:
             piece = f"За сутки ходов {usage['turns']}"
             if usage["total"]:
-                piece += f", токенов {usage['total']:,}".replace(",", " ")
+                piece += f", токенов {_spaced(usage['total'])}"
             if usage["context_used"] and usage["context_window"]:
                 share = usage["context_used"] / usage["context_window"] * 100
                 piece += f"; контекст заполнен на {share:.0f}%"
