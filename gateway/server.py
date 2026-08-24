@@ -176,34 +176,84 @@ def _atr_15m(instrument_id: str, ticker: str) -> float:
     return float(summary.get("atr14") or 0.0)
 
 
-def _check_ambiguous(instrument_id: str, ticker: str) -> None:
+# Сколько ждать, прежде чем считать, что заявка до брокера не дошла вовсе.
+LOST_AFTER = 5 * 60
+
+
+def _resolve_pending(instrument_id: str, ticker: str, direction: str) -> None:
     """Не отправлять новую заявку, пока не выяснена судьба предыдущей.
 
     Если брокер принял заявку, а ответ потерялся, повтор с новым ключом
     создаст вторую позицию. Поэтому сначала спрашиваем брокера про наш
-    собственный идентификатор.
+    собственный идентификатор — он его возвращает как есть.
     """
-    pending = journal.ambiguous_intents(instrument_id)
+    # Незакрытая покупка не должна мешать продать: выход разрешён всегда.
+    pending = [
+        intent
+        for intent in journal.blocking_intents(instrument_id)
+        if intent["direction"] == direction
+    ]
     if not pending:
         return
+
     try:
         live = {order["order_id"] for order in client().active_orders()}
-    except TInvestError:
-        live = set()
-    unresolved = []
-    for intent in pending:
-        if intent["request_id"] in live:
-            journal.set_intent_state(intent["request_id"], "live", "нашлась в активных")
-            unresolved.append(intent["request_id"])
-        else:
-            unresolved.append(intent["request_id"])
-    if unresolved:
+    except TInvestError as exc:
         raise GuardRejection(
-            f"Отклонено: по {ticker} есть заявка с неизвестной судьбой "
-            f"({unresolved[0]}). Ответ брокера не дошёл, поэтому она могла быть "
-            f"принята. Проверь active_orders и operations, при необходимости "
-            f"сними её через cancel_order — и только потом отправляй новую."
+            f"Судьба предыдущей заявки по {ticker} неизвестна, а брокер сейчас "
+            f"недоступен ({exc}). Повторять вслепую нельзя — попробуй позже."
+        ) from exc
+
+    blocking = []
+    for intent in pending:
+        request_id = intent["request_id"]
+        if request_id in live:
+            journal.set_intent_state(request_id, "live", "висит активной")
+            blocking.append((request_id, "висит активной заявкой"))
+            continue
+        # Заявки нет среди активных. Либо она исполнилась, либо не дошла.
+        if _filled_since(instrument_id, intent["ts"]):
+            journal.set_intent_state(request_id, "filled", "нашлась в операциях")
+            continue
+        if time.time() - intent["ts"] < LOST_AFTER:
+            blocking.append((request_id, "ещё может появиться"))
+            continue
+        journal.set_intent_state(request_id, "lost", "не появилась ни в заявках, ни в операциях")
+
+    if blocking:
+        request_id, why = blocking[0]
+        raise GuardRejection(
+            f"Отклонено: по {ticker} есть заявка {request_id}, судьба которой не "
+            f"закрыта — {why}. Посмотри active_orders и operations; если она "
+            f"активна, сними её через cancel_order. Это защита от второй позиции "
+            f"на том же тезисе."
         )
+
+
+def _filled_since(instrument_id: str, since: float) -> bool:
+    """Была ли по бумаге исполненная операция после указанного момента."""
+    info = marketdata.resolve(marketdata.ticker_for(instrument_id) or "") or {}
+    figi = info.get("figi", "")
+    try:
+        operations = client().operations(1)
+    except TInvestError:
+        return False
+    for item in operations:
+        if item.get("state") != "OPERATION_STATE_EXECUTED":
+            continue
+        if figi and item.get("figi") and item.get("figi") != figi:
+            continue
+        moment = _iso_ts(item.get("date", ""))
+        if moment and moment >= since - 60:
+            return True
+    return False
+
+
+def _iso_ts(value: str) -> float:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return 0.0
 
 
 def _order(
@@ -221,7 +271,7 @@ def _order(
     guards.check_rate_limit()
     instrument = _resolve(instrument_id)
     ticker, figi, lot_size = instrument["ticker"], instrument["figi"], instrument["lot"]
-    _check_ambiguous(instrument_id, ticker)
+    _resolve_pending(instrument_id, ticker, "buy" if buying else "sell")
 
     checks: dict = {}
     if buying:
@@ -232,7 +282,12 @@ def _order(
         journal.log_snapshot(portfolio["total"], portfolio["cash"], portfolio["positions"])
         guards.check_capital_floor(portfolio["total"])
         guards.check_daily_loss(portfolio["total"])
-        guards.check_positions(portfolio, instrument_id)
+        pending_buys = {
+            order.get("instrument_id")
+            for order in api.active_orders()
+            if str(order.get("direction", "")).endswith("BUY")
+        }
+        guards.check_positions(portfolio, instrument_id, pending_buys)
         guards.check_entries_today()
         guards.check_cooldown(instrument_id, ticker)
 
@@ -684,7 +739,13 @@ def tool_active_orders() -> list[dict]:
     _obj({"order_id": {"type": "string"}}, ["order_id"]),
 )
 def tool_cancel_order(order_id: str) -> dict:
-    return {"cancelled_at": client().cancel_order(order_id)}
+    cancelled_at = client().cancel_order(order_id)
+    # Идентификатор заявки — это наш ключ идемпотентности, поэтому снятие
+    # закрывает и намерение: иначе оно блокировало бы бумагу дальше.
+    if journal.intent_by_request(order_id):
+        journal.set_intent_state(order_id, "cancelled", "снята агентом")
+    journal.close_order(order_id, "EXECUTION_REPORT_STATUS_CANCELLED")
+    return {"cancelled_at": cancelled_at}
 
 
 @tool(

@@ -16,7 +16,6 @@ import json
 import sqlite3
 import time
 import urllib.parse
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo

@@ -55,8 +55,71 @@ class OrderPath(JournalCase):
         self.broker.post_error = None
         with self.assertRaises(guards.GuardRejection) as caught:
             self.buy()
-        self.assertIn("неизвестной судьбой", str(caught.exception))
+        self.assertIn("не закрыта", str(caught.exception))
         self.assertEqual(self.broker.posted, [])
+
+    def test_висящая_заявка_блокирует_и_помечается(self):
+        self.broker.post_error = ConnectionResetError("оборвалось")
+        with self.assertRaises(guards.GuardRejection):
+            self.buy()
+        request_id = journal.connect().execute(
+            "SELECT request_id FROM order_intents"
+        ).fetchone()["request_id"]
+        self.broker.post_error = None
+        self.broker.active = [{"order_id": request_id}]
+        with self.assertRaises(guards.GuardRejection) as caught:
+            self.buy()
+        self.assertIn("висит активной", str(caught.exception))
+        self.assertEqual(
+            journal.intent_by_request(request_id)["state"], "live"
+        )
+
+    def test_снятие_заявки_разблокирует_бумагу(self):
+        self.broker.post_error = ConnectionResetError("оборвалось")
+        with self.assertRaises(guards.GuardRejection):
+            self.buy()
+        request_id = journal.connect().execute(
+            "SELECT request_id FROM order_intents"
+        ).fetchone()["request_id"]
+        self.broker.post_error = None
+        server.tool_cancel_order(request_id)
+        self.assertEqual(journal.intent_by_request(request_id)["state"], "cancelled")
+        self.buy()
+        self.assertEqual(len(self.broker.posted), 1)
+
+    def test_исполнившаяся_заявка_разблокирует_бумагу(self):
+        self.broker.post_error = ConnectionResetError("оборвалось")
+        with self.assertRaises(guards.GuardRejection):
+            self.buy()
+        self.broker.post_error = None
+        # Заявки нет среди активных, но в операциях есть исполнение.
+        from datetime import datetime, timezone
+
+        self.broker.ops = [
+            {
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "type": "OPERATION_TYPE_BUY",
+                "state": "OPERATION_STATE_EXECUTED",
+                "figi": "FIGI1",
+                "quantity": 3,
+            }
+        ]
+        self.buy()
+        self.assertEqual(len(self.broker.posted), 1)
+
+    def test_потерянная_заявка_разблокирует_по_истечении(self):
+        self.broker.post_error = ConnectionResetError("оборвалось")
+        with self.assertRaises(guards.GuardRejection):
+            self.buy()
+        self.broker.post_error = None
+        # Прошло больше пяти минут, заявка не появилась нигде.
+        conn = journal.connect()
+        conn.execute(
+            "UPDATE order_intents SET ts = ts - ?", (server.LOST_AFTER + 60,)
+        )
+        conn.commit()
+        self.buy()
+        self.assertEqual(len(self.broker.posted), 1)
 
     def test_явный_отказ_брокера_закрывает_ключ(self):
         self.broker.post_error = TInvestError("вне торгов", code="30079")
@@ -115,3 +178,60 @@ class OrderPath(JournalCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Loopholes(JournalCase):
+    """Обходные пути, которые лимиты должны закрывать."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.broker = FakeBroker(bars=flat_bars())
+        server._client = self.broker
+
+    def buy(self, **kwargs):
+        return server._order(
+            "ORDER_DIRECTION_BUY", kwargs.pop("uid", "uid"), 3, None, "тезис",
+            dict(CARD),
+        )
+
+    def test_стопка_лимиток_не_обходит_лимит_позиций(self):
+        # Позиций нет, но две заявки на вход уже висят.
+        self.broker.active = [
+            {"order_id": "1", "instrument_id": "a", "direction": "ORDER_DIRECTION_BUY"},
+            {"order_id": "2", "instrument_id": "b", "direction": "ORDER_DIRECTION_BUY"},
+        ]
+        with self.assertRaises(guards.GuardRejection) as caught:
+            self.buy()
+        self.assertIn("заявок на вход", str(caught.exception))
+
+    def test_заявка_на_продажу_место_не_занимает(self):
+        self.broker.active = [
+            {"order_id": "1", "instrument_id": "a", "direction": "ORDER_DIRECTION_SELL"},
+            {"order_id": "2", "instrument_id": "b", "direction": "ORDER_DIRECTION_SELL"},
+        ]
+        self.buy()
+        self.assertEqual(len(self.broker.posted), 1)
+
+    def test_незакрытая_покупка_не_мешает_продать(self):
+        # Покупка с неизвестной судьбой блокирует новую покупку, но не выход.
+        self.broker.post_error = ConnectionResetError("оборвалось")
+        with self.assertRaises(guards.GuardRejection):
+            self.buy()
+        self.broker.post_error = None
+        server._order("ORDER_DIRECTION_SELL", "uid", 1, None, "выхожу")
+        self.assertEqual(len(self.broker.posted), 1)
+
+    def test_отказ_шлюза_не_тратит_лимит_частоты(self):
+        # Карточка не прошла барьер — обращения к брокеру не было.
+        with self.assertRaises(guards.GuardRejection):
+            server._order(
+                "ORDER_DIRECTION_BUY", "uid", 3, None, "тезис",
+                {"stop": 97.0, "target": 101.0, "playbook": "p", "base_rate": "b"},
+            )
+        self.assertEqual(journal.orders_last_hour(), 0)
+
+    def test_попытка_с_обрывом_тратит_лимит_частоты(self):
+        self.broker.post_error = ConnectionResetError("оборвалось")
+        with self.assertRaises(guards.GuardRejection):
+            self.buy()
+        self.assertEqual(journal.orders_last_hour(), 1)

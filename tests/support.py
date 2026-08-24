@@ -97,6 +97,13 @@ class FakeBroker:
     def active_orders(self) -> list[dict]:
         return list(self.active)
 
+    def operations(self, days: int = 7) -> list[dict]:
+        return list(getattr(self, "ops", []))
+
+    def cancel_order(self, order_id: str) -> str:
+        self.active = [o for o in self.active if o.get("order_id") != order_id]
+        return "2026-08-24T12:00:00Z"
+
     def post_order(self, instrument_id, lots, direction, price=None, order_id="") -> dict:
         if self.post_error is not None:
             raise self.post_error

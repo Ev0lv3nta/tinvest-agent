@@ -10,12 +10,11 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sys
 import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -308,7 +307,7 @@ class Supervisor:
     @staticmethod
     def quota_line() -> str:
         try:
-            data = limits.snapshot()
+            data = limits.fetch()
         except Exception:  # noqa: BLE001 — квота не повод ломать пробуждение
             return ""
         accounts = data.get("accounts") or []

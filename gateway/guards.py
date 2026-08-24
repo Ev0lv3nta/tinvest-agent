@@ -177,19 +177,28 @@ def check_sell(lots: int, limits: dict, ticker: str) -> None:
         )
 
 
-def check_positions(portfolio: dict, instrument_id: str) -> None:
-    open_positions = {
+def check_positions(
+    portfolio: dict, instrument_id: str, pending_buys: Optional[set] = None
+) -> None:
+    """Лимит считает и висящие заявки на вход.
+
+    Иначе его обходят стопкой неисполненных лимиток: позиций формально нет,
+    а обязательства уже набраны.
+    """
+    taken = {
         position.get("instrument_id")
         for position in portfolio.get("positions", [])
         if (position.get("quantity") or 0) > 0
     }
-    if instrument_id in open_positions:
+    taken |= set(pending_buys or ())
+    if instrument_id in taken:
         return
-    if len(open_positions) >= config.MAX_POSITIONS:
+    if len(taken) >= config.MAX_POSITIONS:
         raise GuardRejection(
-            f"Отклонено: уже {len(open_positions)} открытых позиций при лимите "
+            f"Отклонено: уже {len(taken)} позиций и заявок на вход при лимите "
             f"{config.MAX_POSITIONS}. Внимание не делится бесконечно: чтобы "
-            f"взять новую идею, закрой ту, в которую веришь меньше."
+            f"взять новую идею, закрой ту, в которую веришь меньше, или сними "
+            f"её заявку."
         )
 
 

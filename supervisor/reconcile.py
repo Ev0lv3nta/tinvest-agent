@@ -88,11 +88,11 @@ def sync_orders() -> int:
         # Точный статус доспросить нечем, поэтому фиксируем по факту.
         if (row["lots_executed"] or 0) >= row["lots"]:
             status = "EXECUTION_REPORT_STATUS_FILL"
+        elif (row["lots_executed"] or 0) > 0:
+            status = "EXECUTION_REPORT_STATUS_PARTIALLYFILL"
         else:
             status = "EXECUTION_REPORT_STATUS_CANCELLED"
-        journal.update_order_status(
-            row["order_id"], status, row["lots_executed"] or 0, row["price"] or 0.0
-        )
+        journal.close_order(row["order_id"], status)
         changed += 1
     if changed:
         journal.log_event("orders_synced", {"updated": changed})

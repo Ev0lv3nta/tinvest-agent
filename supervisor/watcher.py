@@ -86,7 +86,10 @@ class Watcher(threading.Thread):
         expired = journal.expire_watches()
         if expired:
             journal.log_event("watches_expired", {"count": expired})
-        rows = journal.active_watches()
+        rows = [
+            row for row in journal.active_watches()
+            if row["kind"] in ("price_above", "price_below", "pct_move")
+        ]
         if not rows or not self.market_open():
             return []
 

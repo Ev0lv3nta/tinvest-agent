@@ -275,9 +275,14 @@ def log_event(kind: str, payload: Any = None) -> None:
 
 
 def orders_last_hour() -> int:
+    """Попытки, а не только записанные ответы.
+
+    Считаются намерения: таймаут, отказ брокера и оборванный запрос — тоже
+    обращения к бирже, и от зацикливания защищать надо именно от них.
+    """
     conn = connect()
     row = conn.execute(
-        "SELECT COUNT(*) AS n FROM orders WHERE ts > ?", (time.time() - 3600,)
+        "SELECT COUNT(*) AS n FROM order_intents WHERE ts > ?", (time.time() - 3600,)
     ).fetchone()
     return int(row["n"])
 
@@ -541,18 +546,46 @@ def set_intent_state(request_id: str, state: str, detail: str = "") -> None:
     conn.commit()
 
 
-def ambiguous_intents(instrument_id: str = "") -> list[sqlite3.Row]:
-    """Намерения, судьба которых неизвестна: ответ брокера не дошёл."""
+# Состояния, при которых новую заявку по бумаге отправлять нельзя: либо мы
+# не знаем судьбу предыдущей, либо знаем, что она висит активной.
+BLOCKING_STATES = ("ambiguous", "live")
+
+
+def blocking_intents(instrument_id: str = "") -> list[sqlite3.Row]:
+    """Намерения, мешающие отправить новую заявку по этой бумаге."""
     conn = connect()
+    marks = ",".join("?" * len(BLOCKING_STATES))
     if instrument_id:
         return conn.execute(
-            "SELECT * FROM order_intents WHERE state = 'ambiguous'"
-            " AND instrument_id = ? ORDER BY ts",
-            (instrument_id,),
+            f"SELECT * FROM order_intents WHERE state IN ({marks})"
+            f" AND instrument_id = ? ORDER BY ts",
+            (*BLOCKING_STATES, instrument_id),
         ).fetchall()
     return conn.execute(
-        "SELECT * FROM order_intents WHERE state = 'ambiguous' ORDER BY ts"
+        f"SELECT * FROM order_intents WHERE state IN ({marks}) ORDER BY ts",
+        BLOCKING_STATES,
     ).fetchall()
+
+
+def intent_by_request(request_id: str) -> Optional[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM order_intents WHERE request_id = ?", (request_id,)
+    ).fetchone()
+
+
+def close_order(order_id: str, status: str) -> None:
+    """Пометить заявку закрытой, не трогая уже исполненный объём.
+
+    Частично исполненная лимитка после снятия остаётся частично исполненной:
+    обнулять lots_executed нельзя, иначе сделка исчезнет из статистики.
+    """
+    conn = connect()
+    conn.execute(
+        "UPDATE orders SET status = ?, closed_ts = ? WHERE order_id = ?",
+        (status, time.time(), order_id),
+    )
+    conn.commit()
 
 
 def update_order_status(order_id: str, status: str, lots_executed: int, price: float) -> None:
