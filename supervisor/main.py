@@ -194,6 +194,16 @@ class Supervisor:
         journal.kv_set("thread_id", thread_id)
         journal.log_event("thread_started", {"thread_id": thread_id})
 
+    def reset_live_state(self) -> None:
+        """После старта агент ничего не делает, пока его не разбудят.
+
+        Без этого панель показывала «работает» с прошлого запуска: значение
+        писалось при доставке и никем не сбрасывалось.
+        """
+        journal.kv_set("agent_state", "спит")
+        journal.kv_set("live_text", "")
+        journal.kv_set("live_activity", "")
+
     # --- доставка сообщений ------------------------------------------------
 
     def deliver(self, text: str, kind: str, urgent: bool = False) -> bool:
@@ -794,6 +804,7 @@ class Supervisor:
         journal.log_event("supervisor_start", {})
         self.bot.set_commands()
         self.start_codex()
+        self.reset_live_state()
         self.bot.send("▶️ Супервизор запущен, сессия агента активна.")
 
         poller = threading.Thread(target=self._poll_telegram, daemon=True)
