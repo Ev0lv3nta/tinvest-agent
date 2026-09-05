@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import math
 import re
 import sys
 import threading
@@ -26,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 from . import config, guards, journal, marketdata, search
 from .guards import GuardRejection
-from .tinvest import SandboxClient, TInvestError
+from .tinvest import OrderNotFound, SandboxClient, TInvestError
 
 MSK = ZoneInfo("Europe/Moscow")
 PROTOCOL_VERSION = "2024-11-05"
@@ -166,26 +167,47 @@ def _resolve(instrument_id: str) -> dict:
 
 
 def _atr_15m(instrument_id: str, ticker: str) -> float:
-    """Шум бумаги в единицах цены. Файл кешируется, лишнего запроса нет."""
+    """Шум бумаги в единицах цены. Файл кешируется, лишнего запроса нет.
+
+    Недоступность данных — причина отказать во входе, а не работать без
+    барьера. Раньше любая ошибка возвращала ноль, а ноль в `check_trade_card`
+    означает «ATR не задан, проверку пропускаем»: сбой свечей выключал
+    обязательный фильтр вместо того, чтобы остановить сделку. Отсутствие
+    обязательного признака — это отсутствие основания для входа.
+    """
     try:
         summary = marketdata.candles(
             client(), instrument_id, "CANDLE_INTERVAL_15_MIN", 3, name=ticker
         )
-    except Exception:  # noqa: BLE001 — барьер по шуму не должен ломать сделку
-        return 0.0
-    return float(summary.get("atr14") or 0.0)
-
-
-# Сколько ждать, прежде чем считать, что заявка до брокера не дошла вовсе.
-LOST_AFTER = 5 * 60
+    except Exception as exc:  # noqa: BLE001 — источник может лежать
+        raise GuardRejection(
+            f"Отклонено: не удалось получить свечи {ticker} для расчёта ATR "
+            f"({type(exc).__name__}: {exc}). Барьер по шуму обязателен, а без "
+            f"данных он не считается. Повтори позже или проверь quote."
+        ) from exc
+    noise = float(summary.get("atr14") or 0.0)
+    closed = int(summary.get("closed_bars") or 0)
+    if noise <= 0 or closed < 15:
+        raise GuardRejection(
+            f"Отклонено: ATR(15м) по {ticker} не посчитан — закрытых свечей "
+            f"{closed}, ATR {noise}. Барьер по шуму обязателен: без него стоп "
+            f"нечем сравнить с обычным движением бумаги."
+        )
+    return noise
 
 
 def _resolve_pending(instrument_id: str, ticker: str, direction: str) -> None:
     """Не отправлять новую заявку, пока не выяснена судьба предыдущей.
 
-    Если брокер принял заявку, а ответ потерялся, повтор с новым ключом
-    создаст вторую позицию. Поэтому сначала спрашиваем брокера про наш
-    собственный идентификатор — он его возвращает как есть.
+    Выяснение — это точный запрос состояния по идентификатору, и только он.
+    Раньше вывод делался из отсутствия заявки в списке активных, а если
+    брокер вообще не отвечал, через пять минут намерение объявлялось
+    потерянным и вход разрешался. То есть недоступность API работала как
+    разрешение удвоить позицию — ровно в тот момент, когда проверить ничего
+    нельзя.
+
+    Теперь неизвестность не истекает по таймеру. Она снимается ответом
+    брокера, и ничем другим.
     """
     # Незакрытая покупка не должна мешать продать: выход разрешён всегда.
     pending = [
@@ -196,57 +218,136 @@ def _resolve_pending(instrument_id: str, ticker: str, direction: str) -> None:
     if not pending:
         return
 
-    try:
-        live = {order["order_id"] for order in client().active_orders()}
-    except TInvestError as exc:
-        raise GuardRejection(
-            f"Судьба предыдущей заявки по {ticker} неизвестна, а брокер сейчас "
-            f"недоступен ({exc}). Повторять вслепую нельзя — попробуй позже."
-        ) from exc
-
     blocking = []
     for intent in pending:
-        request_id = intent["request_id"]
-        if request_id in live:
-            journal.set_intent_state(request_id, "live", "висит активной")
-            blocking.append((request_id, "висит активной заявкой"))
-            continue
-        # Заявки нет среди активных. Либо она исполнилась, либо не дошла.
-        if _filled_since(instrument_id, intent["ts"]):
-            journal.set_intent_state(request_id, "filled", "нашлась в операциях")
-            continue
-        if time.time() - intent["ts"] < LOST_AFTER:
-            blocking.append((request_id, "ещё может появиться"))
-            continue
-        journal.set_intent_state(request_id, "lost", "не появилась ни в заявках, ни в операциях")
+        why = _resolve_intent(intent, ticker)
+        if why:
+            blocking.append((intent["request_id"], why))
 
     if blocking:
         request_id, why = blocking[0]
         raise GuardRejection(
             f"Отклонено: по {ticker} есть заявка {request_id}, судьба которой не "
-            f"закрыта — {why}. Посмотри active_orders и operations; если она "
-            f"активна, сними её через cancel_order. Это защита от второй позиции "
-            f"на том же тезисе."
+            f"закрыта — {why}. Пока она не выяснена, вторая заявка в ту же "
+            f"сторону запрещена: если первая исполнилась, это удвоение позиции.\n"
+            f"Посмотри order_state('{request_id}'), active_orders и operations. "
+            f"Если заявка активна — сними её через cancel_order. Если брокер "
+            f"недоступен, подожди и повтори проверку; сама по себе пауза "
+            f"неизвестность не снимает."
         )
 
 
-def _filled_since(instrument_id: str, since: float) -> bool:
-    """Была ли по бумаге исполненная операция после указанного момента."""
-    info = marketdata.resolve(marketdata.ticker_for(instrument_id) or "") or {}
+def _resolve_intent(intent, ticker: str) -> str:
+    """Выяснить судьбу намерения. Пустая строка — выяснена, можно дальше.
+
+    Возвращаемый текст объясняет, почему намерение всё ещё блокирует.
+    """
+    request_id = intent["request_id"]
+    order_id = (intent["order_id"] or "") if "order_id" in intent.keys() else ""
+    try:
+        # По биржевому идентификатору, если он у нас есть, иначе по своему
+        # ключу: брокер принимает оба, но должен знать, какой передан.
+        state = client().order_state(order_id or request_id, by_request_id=not order_id)
+    except OrderNotFound:
+        # Брокер ответил, что такой заявки нет. Это содержательный ответ, но
+        # доверять ему в одиночку нельзя: сверяем с операциями по счёту.
+        if time.time() - intent["ts"] < SETTLE_SECONDS:
+            # Операции появляются у брокера не мгновенно. Сразу после
+            # отправки «нет заявки и нет операции» ещё не отличается от
+            # «только что исполнилась и не доехала». Пауза здесь работает
+            # в сторону запрета, а не разрешения.
+            return (
+                "прошло слишком мало времени, чтобы отличить неотправленную "
+                "заявку от только что исполненной"
+            )
+        evidence = _fill_evidence(intent)
+        if evidence == "none":
+            journal.set_intent_state(request_id, "not_placed", "брокер такой заявки не знает")
+            return ""
+        if evidence == "unknown":
+            return "брокер такой заявки не знает, но операции по счёту не читаются"
+        journal.log_event(
+            "intent_contradiction",
+            {
+                "request_id": request_id,
+                "ticker": ticker,
+                "detail": "нет заявки, но есть операция",
+            },
+        )
+        return (
+            "брокер не находит заявку, но по бумаге есть исполненная операция "
+            "в ту же сторону — расхождение, нужен разбор"
+        )
+    except TInvestError as exc:
+        return f"состояние заявки не читается ({exc})"
+
+    status = state.get("status") or ""
+    journal.update_order_status(
+        state.get("order_id") or order_id or request_id,
+        status,
+        state.get("lots_executed") or 0,
+        state.get("price") or 0.0,
+    )
+    if journal.is_terminal(status):
+        journal.set_intent_state(
+            request_id, _INTENT_BY_STATUS.get(status, "filled"), status,
+            order_id=state.get("order_id") or "",
+        )
+        return ""
+    journal.set_intent_state(
+        request_id, "live", status, order_id=state.get("order_id") or ""
+    )
+    if status in journal.ACTIVE_ORDER_STATUS:
+        executed = state.get("lots_executed") or 0
+        requested = state.get("lots_requested") or 0
+        detail = f" (исполнено {executed} из {requested})" if executed else ""
+        return f"висит активной заявкой{detail}"
+    return f"у брокера в состоянии {status or 'неопределённом'}"
+
+
+# Сколько ждать, прежде чем «заявки нет» станет выводом. Это не таймер
+# истечения неизвестности: по его окончании ничего не разрешается само —
+# только начинает учитываться ответ брокера об отсутствии заявки.
+SETTLE_SECONDS = 30.0
+
+_INTENT_BY_STATUS = {
+    "EXECUTION_REPORT_STATUS_FILL": "filled",
+    "EXECUTION_REPORT_STATUS_CANCELLED": "cancelled",
+    "EXECUTION_REPORT_STATUS_REJECTED": "rejected",
+}
+
+
+def _fill_evidence(intent) -> str:
+    """Есть ли по бумаге исполненная операция в ту же сторону после намерения.
+
+    Возвращает `none`, `found` или `unknown`. Различие между «операции нет» и
+    «операции не читаются» здесь и есть смысл функции: раньше сбой чтения
+    возвращал False и означал «ничего не было».
+
+    Направление сравнивается обязательно. Раньше подходила любая операция по
+    бумаге, и исполненная продажа закрывала неопределённую покупку.
+    """
+    ticker = marketdata.ticker_for(intent["instrument_id"]) or ""
+    info = marketdata.resolve(ticker) or {}
     figi = info.get("figi", "")
+    want = intent["direction"]
     try:
         operations = client().operations(1)
     except TInvestError:
-        return False
+        return "unknown"
     for item in operations:
         if item.get("state") != "OPERATION_STATE_EXECUTED":
             continue
         if figi and item.get("figi") and item.get("figi") != figi:
             continue
+        kind = str(item.get("type") or "")
+        side = "sell" if "SELL" in kind else "buy" if "BUY" in kind else ""
+        if side != want:
+            continue
         moment = _iso_ts(item.get("date", ""))
-        if moment and moment >= since - 60:
-            return True
-    return False
+        if moment and moment >= intent["ts"] - 60:
+            return "found"
+    return "none"
 
 
 def _iso_ts(value: str) -> float:
@@ -268,15 +369,18 @@ def _order(
     buying = direction == "ORDER_DIRECTION_BUY"
     market = price is None
 
-    guards.check_rate_limit()
     instrument = _resolve(instrument_id)
     ticker, figi, lot_size = instrument["ticker"], instrument["figi"], instrument["lot"]
     _resolve_pending(instrument_id, ticker, "buy" if buying else "sell")
 
     checks: dict = {}
     if buying:
-        # Порядок важен: остановка прогона и дневной стоп закрывают вход, но
-        # не выход. Продажа и снятие заявки доступны всегда.
+        # Порядок важен: остановка прогона, дневной стоп и лимит частоты
+        # закрывают вход, но не выход. Продажа и снятие заявки доступны
+        # всегда — иначе защита срабатывает ровно тогда, когда избавиться
+        # от риска нужнее всего. Лимит частоты стоял общим и отбивал
+        # продажу наравне с покупкой.
+        guards.check_rate_limit()
         guards.check_entry_allowed()
         portfolio = api.portfolio()
         journal.log_snapshot(portfolio["total"], portfolio["cash"], portfolio["positions"])
@@ -287,6 +391,7 @@ def _order(
             for order in api.active_orders()
             if str(order.get("direction", "")).endswith("BUY")
         }
+        guards.check_no_pyramiding(portfolio, instrument_id, ticker)
         guards.check_positions(portfolio, instrument_id, pending_buys)
         guards.check_entries_today()
         guards.check_cooldown(instrument_id, ticker)
@@ -309,6 +414,19 @@ def _order(
             ticker=ticker,
             atr=_atr_15m(instrument_id, ticker),
         )
+        guards.check_portfolio_heat(checks["risk_rub"], journal.open_risk(), ticker)
+        # Базовая ставка берётся из реестра, а не из текста заявки: в карточку
+        # попадает то, что было измерено и записано ДО сделки.
+        record = guards.check_playbook(
+            str((card or {}).get("playbook", "")), checks["risk_rub"]
+        )
+        checks["playbook_status"] = record["status"]
+        checks["base_rate"] = {
+            "trades": record["trades"],
+            "wins": record["wins"],
+            "avg_r": record["avg_r"],
+            "measured_on": record["measured_on"],
+        }
         checks["entry"] = round(entry, 4)
 
     limits = api.max_lots(instrument_id, price)
@@ -336,18 +454,32 @@ def _order(
     try:
         result = api.post_order(instrument_id, lots, direction, price, order_id=request_id)
     except TInvestError as exc:
-        # Брокер отказал явно — заявки нет, ключ можно закрыть.
-        journal.set_intent_state(request_id, "rejected", str(exc))
-        raise
-    except Exception as exc:  # noqa: BLE001 — сеть: судьба заявки неизвестна
-        journal.set_intent_state(request_id, "ambiguous", str(exc))
+        if exc.answered:
+            # Брокер разобрал запрос и отказал: заявки у него нет.
+            journal.set_intent_state(request_id, "rejected", str(exc))
+            raise
+        # Ответа не было. Заявка могла дойти и исполниться: единственный
+        # честный вывод — «неизвестно». Ключ остаётся открытым и блокирует
+        # повтор, пока состояние не будет прочитано по идентификатору.
+        journal.set_intent_state(request_id, "unknown", str(exc))
         raise GuardRejection(
-            f"Связь с брокером оборвалась ({type(exc).__name__}). Заявка могла "
-            f"быть принята — её идентификатор {request_id}. Не повторяй вслепую: "
-            f"посмотри active_orders и operations."
+            f"Связь с брокером прервалась ({exc}). Заявка могла быть принята — "
+            f"её ключ {request_id}. Повторять вслепую нельзя: новый ключ создаст "
+            f"вторую заявку поверх возможно исполненной первой.\n"
+            f"Проверь order_state('{request_id}'). Пока состояние неизвестно, "
+            f"вход по {ticker} в эту сторону заблокирован."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — любой иной сбой тоже неизвестность
+        journal.set_intent_state(request_id, "unknown", repr(exc))
+        raise GuardRejection(
+            f"Отправка заявки прервалась ({type(exc).__name__}: {exc}). Судьба "
+            f"заявки {request_id} неизвестна — проверь order_state перед любым "
+            f"повтором."
         ) from exc
 
-    journal.set_intent_state(request_id, "sent", result.get("status", ""))
+    journal.set_intent_state(
+        request_id, "sent", result.get("status", ""), order_id=result.get("order_id") or ""
+    )
     journal.log_order(
         {
             "order_id": result["order_id"],
@@ -657,7 +789,10 @@ def tool_max_lots(instrument_id: str, price: float | None = None) -> dict:
     "шума (ближе 1.5 ATR). Размер позиции тоже считается от стопа, а не от "
     "свободных денег: риск на идею не больше 1000 ₽.\n"
     "Барьер нельзя обойти, изменив числа задним числом: карточка попадает в "
-    "журнал вместе с заявкой.",
+    "журнал вместе с заявкой.\n"
+    "playbook — имя сетапа из реестра. Незарегистрированный сетап торговать "
+    "нельзя: зарегистрируй его через register_playbook до сделки. Сетап без "
+    "накопленной статистики торгуется четвертью размера.",
     _obj(
         {
             "instrument_id": {"type": "string"},
@@ -672,16 +807,12 @@ def tool_max_lots(instrument_id: str, price: float | None = None) -> dict:
                 "type": "string",
                 "description": "класс сетапа из notes/playbooks.md",
             },
-            "base_rate": {
-                "type": "string",
-                "description": "как часто этот сетап срабатывал и на чём измерено",
-            },
             "rationale": {
                 "type": "string",
                 "description": "тезис: что должно произойти и почему рынок этого ещё не учёл",
             },
         },
-        ["instrument_id", "lots", "stop", "target", "playbook", "base_rate", "rationale"],
+        ["instrument_id", "lots", "stop", "target", "playbook", "rationale"],
     ),
 )
 def tool_buy(
@@ -690,17 +821,15 @@ def tool_buy(
     stop: float,
     target: float,
     playbook: str,
-    base_rate: str,
     rationale: str,
     price: float | None = None,
 ) -> dict:
-    if not str(playbook).strip() or not str(base_rate).strip():
-        raise ValueError("playbook и base_rate обязательны и не могут быть пустыми")
+    if not str(playbook).strip():
+        raise ValueError("playbook обязателен: торгуются только зарегистрированные сетапы")
     card = {
         "stop": float(stop),
         "target": float(target),
         "playbook": str(playbook)[:80],
-        "base_rate": str(base_rate)[:400],
     }
     return _order("ORDER_DIRECTION_BUY", instrument_id, lots, price, rationale, card)
 
@@ -739,13 +868,170 @@ def tool_active_orders() -> list[dict]:
     _obj({"order_id": {"type": "string"}}, ["order_id"]),
 )
 def tool_cancel_order(order_id: str) -> dict:
+    """Снять заявку и прочитать, чем она на самом деле кончилась.
+
+    Снятие — это гонка с исполнением. Подтверждение отмены не доказывает,
+    что исполнено ноль: часть могла уйти, пока запрос шёл. Поэтому после
+    отмены состояние читается точно, а не записывается по факту отправки.
+    """
     cancelled_at = client().cancel_order(order_id)
-    # Идентификатор заявки — это наш ключ идемпотентности, поэтому снятие
-    # закрывает и намерение: иначе оно блокировало бы бумагу дальше.
-    if journal.intent_by_request(order_id):
-        journal.set_intent_state(order_id, "cancelled", "снята агентом")
-    journal.close_order(order_id, "EXECUTION_REPORT_STATUS_CANCELLED")
-    return {"cancelled_at": cancelled_at}
+    intent = journal.intent_by_request(order_id)
+    result: dict[str, Any] = {"cancelled_at": cancelled_at}
+    try:
+        state = client().order_state(order_id, by_request_id=bool(intent))
+    except TInvestError as exc:
+        # Отмену подтвердили, но чем кончилась заявка — неизвестно.
+        if intent:
+            journal.set_intent_state(
+                order_id, "unknown", f"снята, состояние не прочитано: {exc}"
+            )
+        result["warning"] = (
+            f"Отмена принята, но состояние заявки не прочиталось ({exc}). "
+            f"Сколько лотов успело исполниться — неизвестно; проверь portfolio "
+            f"и order_state перед новой заявкой."
+        )
+        return result
+
+    status = state.get("status") or "EXECUTION_REPORT_STATUS_CANCELLED"
+    executed = state.get("lots_executed") or 0
+    journal.update_order_status(
+        state.get("order_id") or order_id, status, executed, state.get("price") or 0.0
+    )
+    if intent:
+        journal.set_intent_state(
+            order_id,
+            _INTENT_BY_STATUS.get(status, "cancelled")
+            if journal.is_terminal(status)
+            else "live",
+            status,
+            order_id=state.get("order_id") or "",
+        )
+    result["status"] = status
+    result["lots_executed"] = executed
+    if executed:
+        result["note"] = (
+            f"До отмены успело исполниться {executed} лот(ов) — позиция "
+            f"изменилась, свободные лоты пересчитай по portfolio."
+        )
+    return result
+
+
+@tool(
+    "register_playbook",
+    "Зарегистрировать или обновить сетап. Торгуются только сетапы из "
+    "реестра, и размер зависит от накопленной статистики: до 15 сделок с "
+    "положительным средним R — четверть размера, дальше полный.\n"
+    "measured_on — на чём считалась статистика: период, бумаги, как "
+    "проверял. «Выглядит перспективно» статистикой не является. Числа "
+    "проверяются: попаданий не больше сделок.",
+    _obj(
+        {
+            "name": {"type": "string"},
+            "entry": {"type": "string", "description": "условие входа, проверяемое по данным"},
+            "invalidation": {
+                "type": "string",
+                "description": "что докажет, что сетап не работает",
+            },
+            "measured_on": {
+                "type": "string",
+                "description": "период, бумаги и способ измерения статистики",
+            },
+            "trades": {"type": "integer", "description": "число наблюдений"},
+            "wins": {"type": "integer", "description": "сколько из них в плюс"},
+            "avg_r": {"type": "number", "description": "средний результат в R"},
+        },
+        ["name", "entry", "invalidation", "measured_on", "trades", "wins", "avg_r"],
+    ),
+)
+def tool_register_playbook(
+    name: str,
+    entry: str,
+    invalidation: str,
+    measured_on: str,
+    trades: int,
+    wins: int,
+    avg_r: float,
+) -> dict:
+    if not str(name).strip():
+        raise ValueError("имя сетапа обязательно")
+    trades, wins = int(trades), int(wins)
+    if trades < 0 or wins < 0 or wins > trades:
+        raise ValueError(
+            f"числа не сходятся: попаданий {wins} при {trades} сделках. "
+            f"Реестр — это запись измерения, а не оценки."
+        )
+    if not math.isfinite(float(avg_r)):
+        raise ValueError("средний результат должен быть конечным числом")
+    for field, value in (("entry", entry), ("invalidation", invalidation),
+                         ("measured_on", measured_on)):
+        if len(str(value).strip()) < 10:
+            raise ValueError(
+                f"{field}: слишком коротко. Условие, которое нельзя проверить "
+                f"по данным, не является условием."
+            )
+    return journal.register_playbook(
+        {
+            "name": name, "entry": entry, "invalidation": invalidation,
+            "measured_on": measured_on, "trades": trades, "wins": wins, "avg_r": avg_r,
+        }
+    )
+
+
+@tool(
+    "playbooks",
+    "Реестр сетапов: статус, статистика, условия. Статус выводится из чисел: "
+    "working — не меньше 15 сделок при положительном среднем R, probation — "
+    "всё остальное, retired — снят вручную.",
+    _obj({}),
+)
+def tool_playbooks() -> list[dict]:
+    return journal.playbooks()
+
+
+@tool(
+    "retire_playbook",
+    "Снять сетап с торговли. Нужно, когда собственная проверка дала "
+    "отрицательную базу: торговать сетап, который сам измерил как "
+    "неработающий, запрещено.",
+    _obj({"name": {"type": "string"}, "why": {"type": "string"}}, ["name", "why"]),
+)
+def tool_retire_playbook(name: str, why: str) -> dict:
+    if journal.playbook(name) is None:
+        raise ValueError(f"сетап {name!r} не зарегистрирован")
+    journal.retire_playbook(name, why)
+    return journal.playbook(name)
+
+
+@tool(
+    "order_state",
+    "Точное состояние заявки по идентификатору. Принимает и наш ключ "
+    "(request_id из ответа buy/sell), и биржевой orderId. Это единственный "
+    "способ узнать судьбу заявки: отсутствие в active_orders не отличает "
+    "исполненную от отменённой. Если после обрыва связи вход заблокирован — "
+    "разблокирует его именно этот вызов.",
+    _obj({"order_id": {"type": "string"}}, ["order_id"]),
+)
+def tool_order_state(order_id: str) -> dict:
+    intent = journal.intent_by_request(order_id)
+    if intent is not None:
+        why = _resolve_intent(intent, intent["ticker"] or "")
+        state = journal.intent_by_request(order_id)
+        return {
+            "request_id": order_id,
+            "order_id": state["order_id"] or "",
+            "intent_state": state["state"],
+            "detail": state["detail"] or "",
+            "blocking": why or "",
+            "resolved": not why,
+        }
+    try:
+        state = client().order_state(order_id)
+    except OrderNotFound:
+        return {"order_id": order_id, "found": False,
+                "note": "брокер такой заявки не знает"}
+    state.pop("raw", None)
+    state["found"] = True
+    return state
 
 
 @tool(

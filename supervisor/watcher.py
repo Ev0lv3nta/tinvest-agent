@@ -8,6 +8,10 @@
 Наблюдение за уровнем — работа для одного batch-запроса раз в полминуты.
 Модель просыпается, когда условие выполнено, и получает сразу цену и свою
 заметку о том, что это значит.
+
+Сработавшее условие не доставляется отсюда: оно кладётся в очередь сообщений
+той же транзакцией, которой снимается наблюдатель. Поток наблюдателя не
+должен зависеть ни от состояния канала, ни от того, жив ли получатель.
 """
 
 from __future__ import annotations
@@ -60,12 +64,10 @@ def describe(row, price: float) -> str:
 class Watcher(threading.Thread):
     def __init__(
         self,
-        on_fire: Callable[[list[str]], None],
         market_open: Callable[[], bool],
         client_factory: Callable[[], SandboxClient],
     ) -> None:
         super().__init__(daemon=True, name="watcher")
-        self.on_fire = on_fire
         self.market_open = market_open
         self.client_factory = client_factory
         self.running = True
@@ -80,7 +82,24 @@ class Watcher(threading.Thread):
                     self.tick_urls()
             except Exception as exc:  # noqa: BLE001 — поток не должен падать
                 journal.log_event("watcher_error", {"error": repr(exc)[:300]})
-            time.sleep(INTERVAL_MARKET if self.market_open() else INTERVAL_CLOSED)
+            time.sleep(self.interval())
+
+    def interval(self) -> float:
+        """Частоту задаёт наличие условий, а не только календарь.
+
+        Календарь у нас грубый: суббота и воскресенье считаются выходными
+        целиком, хотя на Мосбирже есть выходные сессии по отдельным
+        инструментам. Ошибиться в частоте опроса дёшево, опоздать со стопом
+        по открытой позиции — нет. Поэтому пока есть хоть одно ценовое
+        условие, опрашиваем часто.
+        """
+        if self.market_open():
+            return INTERVAL_MARKET
+        watching = any(
+            row["kind"] in ("price_above", "price_below", "pct_move")
+            for row in journal.active_watches()
+        )
+        return INTERVAL_MARKET if watching else INTERVAL_CLOSED
 
     def tick(self) -> list[str]:
         expired = journal.expire_watches()
@@ -90,8 +109,13 @@ class Watcher(threading.Thread):
             row for row in journal.active_watches()
             if row["kind"] in ("price_above", "price_below", "pct_move")
         ]
-        if not rows or not self.market_open():
+        if not rows:
             return []
+        # Календарь определяет частоту опроса, но не право проверить условие.
+        # Раньше проверка целиком отключалась по «суббота или воскресенье»,
+        # хотя на Мосбирже есть выходные сессии по отдельным инструментам, а
+        # наблюдатель на уровне открытой позиции — это управление риском.
+        # Если бумага действительно не торгуется, цена просто не придёт.
 
         instruments = sorted({row["instrument_id"] for row in rows})
         try:
@@ -109,11 +133,14 @@ class Watcher(threading.Thread):
             price = prices.get(row["instrument_id"])
             if price is None or not satisfied(row, float(price)):
                 continue
-            journal.mark_watch_fired(row["id"], float(price))
-            fired.append(describe(row, float(price)))
+            text = describe(row, float(price))
+            # Снятие наблюдателя и постановка сообщения — одна транзакция.
+            # Порознь между ними есть зазор: наблюдатель уже снят, сообщения
+            # ещё нет, и падение в этот момент теряет событие насовсем.
+            journal.fire_watch(row["id"], float(price), text)
+            fired.append(text)
         if fired:
             journal.log_event("watches_fired", {"count": len(fired), "texts": fired})
-            self.on_fire(fired)
         return fired
 
     def tick_urls(self) -> list[str]:
@@ -135,13 +162,11 @@ class Watcher(threading.Thread):
                 continue
             if current == row["content_hash"]:
                 continue
-            journal.mark_watch_fired(row["id"], 0.0)
-            fired.append(
-                f"Изменилась страница {row['url']}. Твоя заметка: {row['note']}"
-            )
+            text = f"Изменилась страница {row['url']}. Твоя заметка: {row['note']}"
+            journal.fire_watch(row["id"], 0.0, text)
+            fired.append(text)
         if fired:
             journal.log_event("url_watches_fired", {"count": len(fired), "texts": fired})
-            self.on_fire(fired)
         return fired
 
     def stop(self) -> None:

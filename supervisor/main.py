@@ -105,6 +105,15 @@ def session_name(moment: datetime | None = None) -> str:
 
 
 def market_open(moment: datetime | None = None) -> bool:
+    """Общий календарь: подсказка о частоте опроса, а не право торговать.
+
+    Календарь грубый — суббота и воскресенье считаются выходными целиком,
+    хотя на Мосбирже есть выходные сессии по отдельным инструментам.
+    Поэтому от него не должно зависеть ничего, что управляет риском:
+    наблюдатели за ценой, сверка и выходы работают независимо. Правду о
+    конкретной бумаге даёт её `trading_status`, а заявку вне сессии отобьёт
+    сам брокер кодом 30079.
+    """
     return session_name(moment) not in ("выходной", "вне торгов")
 
 
@@ -830,7 +839,6 @@ class Supervisor:
         poller = threading.Thread(target=self._poll_telegram, daemon=True)
         poller.start()
         self.watcher = Watcher(
-            on_fire=self._watches_fired,
             market_open=market_open,
             client_factory=reconcile.client,
         )
@@ -861,16 +869,6 @@ class Supervisor:
             self.watcher.stop()
         self.codex.stop()
         journal.log_event("supervisor_stop", {})
-
-    @staticmethod
-    def _watches_fired(texts: list[str]) -> None:
-        """Срабатывание кладётся в durable-очередь, а не доставляется сразу.
-
-        Поток наблюдателя не должен зависеть от состояния канала: если он
-        лежит, событие подождёт в базе и уйдёт позже.
-        """
-        for text in texts:
-            journal.enqueue_message(text, source="watch")
 
     def _poll_telegram(self) -> None:
         """Long-polling с отступом при отказах.

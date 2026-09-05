@@ -55,29 +55,53 @@ class Wakeups(JournalCase):
 
 
 class DayBaseline(JournalCase):
+    def snapshot(self, ts: float, total: float) -> None:
+        conn = journal.connect()
+        conn.execute(
+            "INSERT INTO snapshots (ts, total, cash, positions) VALUES (?,?,?,?)",
+            (ts, total, 0.0, "[]"),
+        )
+        conn.commit()
+
     def test_опора_берётся_с_первого_среза_дня(self):
-        journal.connect().execute(
-            "INSERT INTO snapshots (ts, total, cash, positions) VALUES (?,?,?,?)",
-            (msk(10, 5), 99_000.0, 0.0, "[]"),
-        )
-        journal.connect().execute(
-            "INSERT INTO snapshots (ts, total, cash, positions) VALUES (?,?,?,?)",
-            (msk(15, 0), 95_000.0, 0.0, "[]"),
-        )
-        journal.connect().commit()
+        self.snapshot(msk(10, 5), 99_000.0)
+        self.snapshot(msk(15, 0), 95_000.0)
         self.assertEqual(journal.day_open_equity(), 99_000.0)
         self.assertEqual(journal.day_result(97_000.0), -2_000.0)
+
+    def test_ночной_разрыв_не_стирается(self):
+        """База — вчерашнее закрытие, а не первый утренний срез.
+
+        Раньше первый срез нового дня становился точкой отсчёта. Позиция
+        уезжала за ночь на пять тысяч вниз, утро записывало это как новую
+        норму, и дневной стоп начинал день с чистого листа — ровно после
+        самого дорогого события.
+        """
+        self.snapshot(msk(18, 40, days=-1), 100_000.0)
+        self.snapshot(msk(10, 1), 95_000.0)
+        self.assertEqual(journal.day_open_equity(), 100_000.0)
+        self.assertEqual(journal.day_result(95_000.0), -5_000.0)
+
+    def test_опора_не_сдвигается_следующими_срезами(self):
+        self.snapshot(msk(18, 40, days=-1), 100_000.0)
+        self.assertEqual(journal.day_open_equity(), 100_000.0)
+        self.snapshot(msk(12, 0), 90_000.0)
+        self.assertEqual(journal.day_open_equity(), 100_000.0)
+
+    def test_пополнение_сдвигает_опору(self):
+        """Перевод денег на счёт — не результат торговли."""
+        self.snapshot(msk(18, 40, days=-1), 100_000.0)
+        self.assertEqual(journal.day_open_equity(), 100_000.0)
+        journal.adjust_day_base(50_000.0)
+        self.assertEqual(journal.day_open_equity(), 150_000.0)
+        self.assertEqual(journal.day_result(150_000.0), 0.0)
 
     def test_без_срезов_опоры_нет(self):
         self.assertIsNone(journal.day_open_equity())
         self.assertIsNone(journal.day_result(1.0))
 
     def test_вчерашний_срез_если_сегодня_пусто(self):
-        journal.connect().execute(
-            "INSERT INTO snapshots (ts, total, cash, positions) VALUES (?,?,?,?)",
-            (msk(18, 0, days=-1), 101_000.0, 0.0, "[]"),
-        )
-        journal.connect().commit()
+        self.snapshot(msk(18, 0, days=-1), 101_000.0)
         self.assertEqual(journal.day_open_equity(), 101_000.0)
 
     def test_полночь_считается_по_москве(self):
@@ -110,6 +134,102 @@ class Orders(JournalCase):
         self.assertEqual(row["price"], 0.0)
         self.assertIsNotNone(row["closed_ts"])
         self.assertEqual(journal.open_orders(), [])
+
+
+class Intents(JournalCase):
+    def intent(self, request_id: str = "r1") -> None:
+        journal.create_intent(
+            {
+                "request_id": request_id, "instrument_id": "uid", "ticker": "TEST",
+                "direction": "buy", "order_type": "market", "lots": 1,
+            }
+        )
+
+    def test_намерение_до_сети_уже_блокирует(self):
+        """Падение процесса ровно на отправке оставляет именно это состояние.
+
+        Раньше блокировали только два состояния, и `pending` в них не входило:
+        заявка могла висеть у брокера, а шлюз разрешал отправить вторую.
+        """
+        self.intent()
+        self.assertEqual(len(journal.blocking_intents("uid")), 1)
+
+    def test_разрешённое_намерение_не_блокирует(self):
+        self.intent()
+        for state in journal.RESOLVED_STATES:
+            journal.set_intent_state("r1", state)
+            self.assertEqual(journal.blocking_intents("uid"), [], state)
+
+    def test_неизвестное_состояние_блокирует(self):
+        self.intent()
+        journal.set_intent_state("r1", "что-то-новое")
+        self.assertEqual(len(journal.blocking_intents("uid")), 1)
+
+    def test_ключи_хранятся_раздельно(self):
+        self.intent()
+        journal.set_intent_state("r1", "sent", "ок", order_id="exch-9")
+        self.assertEqual(journal.intent_by_order("exch-9")["request_id"], "r1")
+
+
+class OrderStatus(JournalCase):
+    def test_частичное_исполнение_не_конечное(self):
+        self.assertFalse(journal.is_terminal("EXECUTION_REPORT_STATUS_PARTIALLYFILL"))
+        self.assertTrue(journal.is_terminal("EXECUTION_REPORT_STATUS_FILL"))
+        self.assertTrue(journal.is_terminal("EXECUTION_REPORT_STATUS_CANCELLED"))
+        self.assertTrue(journal.is_terminal("EXECUTION_REPORT_STATUS_REJECTED"))
+        self.assertFalse(journal.is_terminal("EXECUTION_REPORT_STATUS_NEW"))
+        self.assertFalse(journal.is_terminal(""))
+
+
+class OpenRisk(JournalCase):
+    def test_риск_складывается_по_позициям(self):
+        conn = journal.connect()
+        journal.log_snapshot(
+            100_000.0, 0.0,
+            [{"instrument_id": "a", "quantity": 10}, {"instrument_id": "b", "quantity": 5}],
+        )
+        for order_id, instrument, risk in (("o1", "a", 900.0), ("o2", "b", 700.0)):
+            conn.execute(
+                "INSERT INTO orders (ts, order_id, instrument_id, direction, order_type,"
+                " lots, lots_executed, price, card) VALUES (?,?,?,'buy','market',1,1,100.0,?)",
+                (time.time(), order_id, instrument, '{"risk_rub": %s}' % risk),
+            )
+        conn.commit()
+        self.assertEqual(journal.open_risk(), 1600.0)
+
+    def test_исполнение_учитывается_до_среза(self):
+        """Срез брокера отстаёт: журнал знает об исполнении раньше."""
+        conn = journal.connect()
+        conn.execute(
+            "INSERT INTO orders (ts, order_id, instrument_id, direction, order_type,"
+            " lots, lots_executed, price, card) VALUES (?,'o9','fresh','buy','market',1,1,100.0,?)",
+            (time.time(), '{"risk_rub": 800.0}'),
+        )
+        conn.commit()
+        self.assertTrue(journal.has_open_entry("fresh"))
+        self.assertEqual(journal.open_risk(), 800.0)
+
+    def test_продажа_снимает_вход(self):
+        conn = journal.connect()
+        for order_id, direction, ts in (("b", "buy", 100.0), ("s", "sell", 200.0)):
+            conn.execute(
+                "INSERT INTO orders (ts, order_id, instrument_id, direction, order_type,"
+                " lots, lots_executed, price) VALUES (?,?,'x',?,'market',1,1,100.0)",
+                (ts, order_id, direction),
+            )
+        conn.commit()
+        self.assertFalse(journal.has_open_entry("x"))
+
+    def test_закрытая_позиция_риска_не_несёт(self):
+        conn = journal.connect()
+        journal.log_snapshot(100_000.0, 0.0, [{"instrument_id": "a", "quantity": 0}])
+        conn.execute(
+            "INSERT INTO orders (ts, order_id, instrument_id, direction, order_type,"
+            " lots, lots_executed, price, card) VALUES (?,'o1','a','buy','market',1,1,100.0,?)",
+            (time.time(), '{"risk_rub": 900.0}'),
+        )
+        conn.commit()
+        self.assertEqual(journal.open_risk(), 0.0)
 
 
 class Watches(JournalCase):
