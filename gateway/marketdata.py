@@ -52,6 +52,23 @@ INTERVAL_MINUTES = {
 # Признак завершённости — часть наблюдения, а не служебное поле. Пока бар
 # не закрыт, его максимум, минимум и закрытие ещё изменятся, и считать по
 # нему уровень или ATR нельзя.
+# Сколько дней брокер отдаёт за один запрос. Измерено на песочнице
+# 05.09.2026; за границей приходит «The maximum request period for the given
+# candle interval has been exceeded», а не пустой ответ.
+MAX_DAYS_PER_REQUEST = {
+    "CANDLE_INTERVAL_1_MIN": 1,
+    "CANDLE_INTERVAL_2_MIN": 1,
+    "CANDLE_INTERVAL_3_MIN": 1,
+    "CANDLE_INTERVAL_5_MIN": 1,
+    "CANDLE_INTERVAL_10_MIN": 7,
+    "CANDLE_INTERVAL_15_MIN": 14,
+    "CANDLE_INTERVAL_30_MIN": 30,
+    "CANDLE_INTERVAL_HOUR": 90,
+    "CANDLE_INTERVAL_2_HOUR": 90,
+    "CANDLE_INTERVAL_4_HOUR": 120,
+    "CANDLE_INTERVAL_DAY": 1825,
+}
+
 CSV_HEADER = ["time", "open", "high", "low", "close", "volume", "complete"]
 
 # Открытие основной сессии. Диапазон первых тридцати минут — опорный уровень
@@ -280,6 +297,13 @@ def candles(
     if interval not in INTERVAL_MINUTES:
         known = ", ".join(sorted(INTERVAL_MINUTES))
         raise ValueError(f"неизвестный интервал {interval!r}. Допустимые: {known}")
+    limit = MAX_DAYS_PER_REQUEST.get(interval)
+    if limit and days > limit:
+        raise ValueError(
+            f"за один запрос брокер отдаёт не больше {limit} дн для интервала "
+            f"{interval[16:].lower()}, запрошено {days}. Глубокая история "
+            f"качается окнами — для проверки на истории есть backtest."
+        )
 
     path = csv_path(name or instrument_id, interval, days)
     fresh = False

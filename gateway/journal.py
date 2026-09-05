@@ -1193,15 +1193,6 @@ def set_watch_hash(watch_id: int, content_hash: str) -> None:
     conn.commit()
 
 
-def mark_watch_fired(watch_id: int, value: float) -> None:
-    conn = connect()
-    conn.execute(
-        "UPDATE watches SET fired_ts = ?, fired_value = ? WHERE id = ?",
-        (time.time(), value, watch_id),
-    )
-    conn.commit()
-
-
 def fire_watch(watch_id: int, value: float, text: str) -> None:
     """Снять наблюдатель и поставить сообщение в очередь одной транзакцией.
 

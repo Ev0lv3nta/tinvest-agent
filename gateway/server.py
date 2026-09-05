@@ -1151,6 +1151,7 @@ def tool_backtest(
     from research import trials
     from research.bars import load_csv
     from research.evaluate import Protocol, evaluate
+    from research.history import fetch
     from research.replay import Costs, Rules
     from research.spec import Spec
 
@@ -1161,17 +1162,20 @@ def tool_backtest(
     if not names:
         raise ValueError("нужен хотя бы один тикер")
 
+    # История качается окнами: брокер отдаёт ограниченный отрезок за запрос,
+    # и полгода часовых свечей одним куском он просто отбивает. Файл живёт
+    # час — перекачивать полгода ради последнего бара незачем.
     bars = []
     missing = []
+    history = marketdata.data_dir() / "history"
     for ticker in names:
         entry = marketdata.resolve(ticker)
         if not entry:
             missing.append(ticker)
             continue
-        summary = marketdata.candles(
-            client(), entry["uid"], interval, days, name=ticker
-        )
-        bars.extend(load_csv(Path(summary["file"]), ticker, minutes))
+        path = history / f"{ticker}_{interval[16:].lower()}_{days}d.csv"
+        fetch(client(), entry["uid"], interval, days, path, max_age=3600)
+        bars.extend(load_csv(path, ticker, minutes))
     if missing:
         raise ValueError(
             f"нет в справочнике: {', '.join(missing)}. Сначала find_instrument."

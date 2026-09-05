@@ -250,7 +250,7 @@ class Watches(JournalCase):
 
     def test_срабатывание_снимает_с_наблюдения(self):
         watch_id = journal.add_watch("uid", "TEST", "price_below", 95.0, "стоп", time.time() + 60)
-        journal.mark_watch_fired(watch_id, 94.5)
+        journal.fire_watch(watch_id, 94.5, "сработало")
         self.assertEqual(journal.active_watches(), [])
 
 

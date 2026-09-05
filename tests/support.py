@@ -126,6 +126,17 @@ class FakeBroker:
     def candles(self, uid, interval, days) -> list[dict]:
         return list(self.bars)
 
+    def candles_between(self, uid, interval, start, end) -> list[dict]:
+        """Окно истории. Настоящий клиент отдаёт ограниченный отрезок за раз."""
+        from datetime import datetime
+
+        out = []
+        for bar in self.bars:
+            moment = datetime.fromisoformat(str(bar["time"]).replace("Z", "+00:00"))
+            if start <= moment < end:
+                out.append(bar)
+        return out
+
     def active_orders(self) -> list[dict]:
         return list(self.active)
 

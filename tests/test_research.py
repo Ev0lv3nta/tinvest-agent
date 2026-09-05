@@ -327,10 +327,16 @@ class GatewayBridge(unittest.TestCase):
         from gateway import marketdata, server
         from tests.support import FakeBroker
 
+        # Ряд заканчивается «сейчас»: инструмент качает историю окнами от
+        # текущего момента назад, и данные из 2024 года в них не попадут.
+        from datetime import datetime, timedelta, timezone
+
+        generated = random_walk(symbols=1, bars=900, seed=5)
+        shift = datetime.now(timezone.utc) - timedelta(hours=1) - generated[-1].start
         bars = []
-        for i, bar in enumerate(random_walk(symbols=1, bars=900, seed=5)):
+        for bar in generated:
             bars.append({
-                "time": bar.start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "time": (bar.start + shift).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "open": bar.open, "high": bar.high, "low": bar.low,
                 "close": bar.close, "volume": bar.volume, "complete": True,
             })
