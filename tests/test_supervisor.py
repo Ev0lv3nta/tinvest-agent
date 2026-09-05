@@ -486,6 +486,51 @@ class ProtocolShapes(JournalCase):
         supervisor_main.Supervisor._record_usage({"turnId": "t5", "tokenUsage": {"last": 5}})
         self.assertEqual(journal.usage_since(3600)["turns"], 1)
 
+    def test_ход_завершившийся_раньше_ответа_не_считается_идущим(self):
+        """Событие приходит отдельным потоком и может обогнать ответ.
+
+        Раньше start_turn выставлял busy безусловно: если turn/completed
+        успевал первым, супервизор навсегда решал, что агент занят, и
+        переставал что-либо доставлять.
+        """
+        from supervisor import appserver
+
+        class Fake(appserver.AppServer):
+            def __init__(self):
+                self.thread_id = "T"
+                self.turn_id = ""
+                self.busy = False
+                self.turn_started = 0.0
+                self._completed = []
+
+            def request(self, method, params, timeout=120):
+                # Ход успел закончиться, пока шёл ответ на его запуск.
+                self._track({"method": "turn/completed", "params": {"turnId": "t9"}})
+                return {"turn": {"id": "t9"}}
+
+        codex = Fake()
+        self.assertEqual(codex.start_turn("привет"), "t9")
+        self.assertFalse(codex.busy)
+        self.assertEqual(codex.turn_id, "")
+
+    def test_обычный_ход_считается_идущим(self):
+        from supervisor import appserver
+
+        class Fake(appserver.AppServer):
+            def __init__(self):
+                self.thread_id = "T"
+                self.turn_id = ""
+                self.busy = False
+                self.turn_started = 0.0
+                self._completed = []
+
+            def request(self, method, params, timeout=120):
+                return {"turn": {"id": "t10"}}
+
+        codex = Fake()
+        self.assertEqual(codex.start_turn("привет"), "t10")
+        self.assertTrue(codex.busy)
+
     def test_подтверждение_получает_решение_а_не_ошибку(self):
         from supervisor import appserver
 

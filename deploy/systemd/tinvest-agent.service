@@ -2,8 +2,11 @@
 Description=Супервизор торгового агента
 After=network-online.target omniroute-tunnel.service
 Wants=network-online.target
-# Без канала к модели агент не работает: поднимаем туннель первым.
-Requires=omniroute-tunnel.service
+# Туннель поднимается первым, но не удерживает нас: Requires означал бы,
+# что падение канала к модели останавливает и супервизор — вместе со
+# сторожем позиций. Управление уже набранным риском не должно зависеть от
+# того, доступна ли модель.
+Wants=omniroute-tunnel.service
 
 [Service]
 Type=simple
