@@ -29,8 +29,15 @@ class JournalCase(unittest.TestCase):
         conn.commit()
 
 
-def msk(hour: int, minute: int = 0, day: int = 24) -> float:
-    return datetime(2026, 8, day, hour, minute, tzinfo=MSK).timestamp()
+def msk(hour: int, minute: int = 0, days: int = 0) -> float:
+    """Момент сегодняшнего торгового дня по Москве, со сдвигом в днях.
+
+    Дата обязана быть относительной. С фиксированной календарной датой тесты
+    проходили только в тот день, когда их писали: половина проверок сравнивает
+    записи с `day_start_ts()`, а он считается от текущего времени.
+    """
+    today = datetime.now(MSK).date() + timedelta(days=days)
+    return datetime(today.year, today.month, today.day, hour, minute, tzinfo=MSK).timestamp()
 
 
 def add_order(**kwargs) -> None:

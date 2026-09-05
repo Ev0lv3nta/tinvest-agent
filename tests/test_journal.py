@@ -75,15 +75,15 @@ class DayBaseline(JournalCase):
     def test_вчерашний_срез_если_сегодня_пусто(self):
         journal.connect().execute(
             "INSERT INTO snapshots (ts, total, cash, positions) VALUES (?,?,?,?)",
-            (msk(18, 0, day=23), 101_000.0, 0.0, "[]"),
+            (msk(18, 0, days=-1), 101_000.0, 0.0, "[]"),
         )
         journal.connect().commit()
         self.assertEqual(journal.day_open_equity(), 101_000.0)
 
     def test_полночь_считается_по_москве(self):
         # 23:30 МСК и 00:30 МСК — разные торговые дни.
-        late = msk(23, 30, day=24)
-        early = msk(0, 30, day=25)
+        late = msk(23, 30)
+        early = msk(0, 30, days=1)
         self.assertNotEqual(journal.day_start_ts(late), journal.day_start_ts(early))
         self.assertEqual(journal.day_start_ts(msk(10, 0)), msk(0, 0))
 
