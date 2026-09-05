@@ -1216,6 +1216,7 @@ def tool_backtest(
 
     answer = {
         "verdict": report["verdict"],
+        "why": report.get("why") or "",
         "file": str(path),
         "spec_version": spec.version,
         "campaign": campaign,

@@ -381,3 +381,23 @@ class GatewayBridge(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             server.tool_backtest(tickers=["НЕТТАКОЙ"], family="breakout")
         self.assertIn("справочнике", str(caught.exception))
+
+
+class Legibility(unittest.TestCase):
+    """Ответ «ничего не нашлось» должен объяснять, что именно не нашлось."""
+
+    def test_ноль_сделок_объясняется(self):
+        from research.bars import Bar
+        from datetime import datetime, timedelta, timezone
+
+        # Ровный ряд: условие входа не выполняется никогда.
+        begin = datetime(2024, 1, 3, 7, 0, tzinfo=timezone.utc)
+        bars = [
+            Bar("FLAT", begin + timedelta(hours=i), begin + timedelta(hours=i + 1),
+                100.0, 100.1, 99.9, 100.0, 1000, True)
+            for i in range(900)
+        ]
+        report = evaluate(grid("breakout", lookback=[20]), bars, trials=1,
+                          protocol=Protocol(min_oos_sessions=5, min_closed_trades=1))
+        self.assertEqual(report["closed_trades"], 0)
+        self.assertIn("отсутствие сделок", report["why"])
