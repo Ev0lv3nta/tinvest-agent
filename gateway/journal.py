@@ -168,7 +168,13 @@ CREATE TABLE IF NOT EXISTS playbooks (
     wins         INTEGER NOT NULL,
     avg_r        REAL    NOT NULL,
     retired      INTEGER NOT NULL DEFAULT 0,
-    retired_why  TEXT
+    retired_why  TEXT,
+    -- Откуда взялись числа: 'evaluator' — посчитал код по истории одним и
+    -- тем же прогоном; 'manual' — записал агент со своих слов. Второе
+    -- остаётся на проверке навсегда: слова не становятся измерением от
+    -- того, что их записали в таблицу.
+    source       TEXT NOT NULL DEFAULT 'manual',
+    evidence     TEXT
 );
 """
 
@@ -182,6 +188,8 @@ MIGRATIONS = [
     ("orders", "card", "TEXT"),
     ("orders", "closed_ts", "REAL"),
     ("order_intents", "order_id", "TEXT"),
+    ("playbooks", "source", "TEXT NOT NULL DEFAULT 'manual'"),
+    ("playbooks", "evidence", "TEXT"),
     ("watches", "base_price", "REAL"),
     ("watches", "url", "TEXT"),
     ("watches", "content_hash", "TEXT"),
@@ -843,6 +851,9 @@ PLAYBOOK_MIN_TRADES = 15
 
 def register_playbook(record: dict) -> dict:
     """Записать или обновить сетап. Статус выводится из чисел, не объявляется."""
+    source = str(record.get("source") or "manual")
+    if source not in ("manual", "evaluator"):
+        raise ValueError(f"неизвестный источник статистики {source!r}")
     conn = connect()
     name = str(record["name"]).strip()[:80]
     now = time.time()
@@ -852,11 +863,13 @@ def register_playbook(record: dict) -> dict:
     created = float(row["created_ts"]) if row else now
     conn.execute(
         "INSERT INTO playbooks (name, created_ts, updated_ts, entry, invalidation,"
-        " measured_on, trades, wins, avg_r) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " measured_on, trades, wins, avg_r, source, evidence)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(name) DO UPDATE SET updated_ts = excluded.updated_ts,"
         " entry = excluded.entry, invalidation = excluded.invalidation,"
         " measured_on = excluded.measured_on, trades = excluded.trades,"
-        " wins = excluded.wins, avg_r = excluded.avg_r",
+        " wins = excluded.wins, avg_r = excluded.avg_r,"
+        " source = excluded.source, evidence = excluded.evidence",
         (
             name,
             created,
@@ -867,10 +880,15 @@ def register_playbook(record: dict) -> dict:
             int(record["trades"]),
             int(record["wins"]),
             float(record["avg_r"]),
+            source,
+            _dump(record.get("evidence")) if record.get("evidence") else None,
         ),
     )
     conn.commit()
-    log_event("playbook_registered", {"name": name, "trades": int(record["trades"])})
+    log_event(
+        "playbook_registered",
+        {"name": name, "trades": int(record["trades"]), "source": source},
+    )
     return playbook(name)
 
 
@@ -902,9 +920,14 @@ def playbooks() -> list[dict]:
 
 def _playbook_view(row: sqlite3.Row) -> dict:
     trades, wins = int(row["trades"]), int(row["wins"])
+    source = row["source"] if "source" in row.keys() else "manual"
     if row["retired"]:
         status = "retired"
-    elif trades >= PLAYBOOK_MIN_TRADES and float(row["avg_r"]) > 0:
+    elif (
+        trades >= PLAYBOOK_MIN_TRADES
+        and float(row["avg_r"]) > 0
+        and source == "evaluator"
+    ):
         status = "working"
     else:
         status = "probation"
@@ -918,6 +941,7 @@ def _playbook_view(row: sqlite3.Row) -> dict:
         "hit_rate": round(wins / trades, 2) if trades else None,
         "avg_r": round(float(row["avg_r"]), 2),
         "status": status,
+        "source": source,
         "retired_why": row["retired_why"] or "",
         "updated_ts": row["updated_ts"],
     }

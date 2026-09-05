@@ -235,12 +235,23 @@ def check_playbook(name: str, risk_rub: float) -> dict:
     if record["status"] == "probation":
         limit = config.MAX_RISK_PER_TRADE * config.PROBATION_RISK_FRACTION
         if risk_rub > limit:
+            if record.get("source") != "evaluator":
+                why = (
+                    "статистика записана с твоих слов. Числа в реестре не "
+                    "становятся измерением от того, что их туда записали — "
+                    "полный размер даёт прогон через backtest, который считает "
+                    "их тем же кодом"
+                )
+            else:
+                why = (
+                    f"{record['trades']} сделок при пороге "
+                    f"{journal.PLAYBOOK_MIN_TRADES}, средний результат "
+                    f"{record['avg_r']}R"
+                )
             raise GuardRejection(
-                f"Отклонено: сетап {name!r} на проверке — {record['trades']} сделок "
-                f"при пороге {journal.PLAYBOOK_MIN_TRADES}, средний результат "
-                f"{record['avg_r']}R. Такие торгуются четвертью размера: риск не "
-                f"больше {limit:.0f} ₽, запрошено {risk_rub:.0f} ₽. Полный размер "
-                f"даёт накопленная статистика, а не уверенность в моменте."
+                f"Отклонено: сетап {name!r} на проверке — {why}. Такие "
+                f"торгуются четвертью размера: риск не больше {limit:.0f} ₽, "
+                f"запрошено {risk_rub:.0f} ₽."
             )
     return record
 

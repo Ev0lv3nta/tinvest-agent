@@ -504,13 +504,23 @@ class SandboxClient:
 
     def candles(self, instrument_id: str, interval: str, days: int) -> list[dict]:
         now = datetime.now(timezone.utc)
+        return self.candles_between(
+            instrument_id, interval, now - timedelta(days=days), now
+        )
+
+    def candles_between(
+        self, instrument_id: str, interval: str, start: datetime, end: datetime
+    ) -> list[dict]:
+        """Явный отрезок. Длинная история берётся окнами: API отдаёт
+        ограниченный диапазон за запрос, и просить сразу год минутных свечей
+        бессмысленно."""
         raw = self.call(
             "MarketDataService",
             "GetCandles",
             {
                 "instrumentId": instrument_id,
-                "from": _utc(now - timedelta(days=days)),
-                "to": _utc(now),
+                "from": _utc(start),
+                "to": _utc(end),
                 "interval": interval,
             },
         )

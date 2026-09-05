@@ -45,7 +45,10 @@ def msk(hour: int, minute: int = 0, days: int = 0) -> float:
     return datetime(today.year, today.month, today.day, hour, minute, tzinfo=MSK).timestamp()
 
 
-def add_playbook(name: str = "test", trades: int = 40, wins: int = 24, avg_r: float = 0.4) -> dict:
+def add_playbook(
+    name: str = "test", trades: int = 40, wins: int = 24, avg_r: float = 0.4,
+    source: str = "evaluator",
+) -> dict:
     """Зарегистрированный сетап: без него вход не пройдёт реестр."""
     return journal.register_playbook(
         {
@@ -53,7 +56,7 @@ def add_playbook(name: str = "test", trades: int = 40, wins: int = 24, avg_r: fl
             "entry": "закрытие выше максимума предыдущих 20 баров",
             "invalidation": "закрытие ниже уровня пробоя в течение двух баров",
             "measured_on": "проверка на дневных барах 2024 года, 12 бумаг",
-            "trades": trades, "wins": wins, "avg_r": avg_r,
+            "trades": trades, "wins": wins, "avg_r": avg_r, "source": source,
         }
     )
 

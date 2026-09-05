@@ -20,10 +20,13 @@ import traceback
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
+
+from research.spec import FAMILIES
 
 from . import config, guards, journal, marketdata, search
 from .guards import GuardRejection
@@ -914,6 +917,145 @@ def tool_cancel_order(order_id: str) -> dict:
             f"изменилась, свободные лоты пересчитай по portfolio."
         )
     return result
+
+
+@tool(
+    "backtest",
+    "Прогнать правило по истории и получить честный ответ «да» или «нет».\n"
+    "Считает один и тот же код: выбор кандидата только на обучающей части, "
+    "зазор перед проверкой, двойные издержки, вход на бар позже, сравнение с "
+    "«ничего не делать» и «купил и держал», нижняя граница с поправкой на "
+    "число уже сделанных попыток.\n"
+    "Каждый вызов — зарегистрированная попытка. Чем больше вариантов "
+    "перебрано, тем строже порог: перебор не бесплатен, и это не наказание, "
+    "а арифметика.\n"
+    "С register_as результат записывается в реестр сетапов числами, которые "
+    "посчитал код. Только такой сетап торгуется полным размером.",
+    _obj(
+        {
+            "tickers": {"type": "array", "items": {"type": "string"}},
+            "family": {"type": "string", "enum": list(FAMILIES)},
+            "interval": {"type": "string"},
+            "days": {"type": "integer", "description": "глубина истории"},
+            "lookback": {"type": "integer"},
+            "stop_atr": {"type": "number"},
+            "target_atr": {"type": "number"},
+            "register_as": {
+                "type": "string",
+                "description": "имя сетапа, под которым записать результат в реестр",
+            },
+        },
+        ["tickers", "family"],
+    ),
+)
+def tool_backtest(
+    tickers: list,
+    family: str,
+    interval: str = "CANDLE_INTERVAL_HOUR",
+    days: int = 180,
+    lookback: int = 20,
+    stop_atr: float = 1.5,
+    target_atr: float = 3.0,
+    register_as: str = "",
+) -> dict:
+    from research import trials
+    from research.bars import load_csv
+    from research.evaluate import Protocol, evaluate
+    from research.replay import Costs, Rules
+    from research.spec import Spec
+
+    minutes = marketdata.INTERVAL_MINUTES.get(interval)
+    if not minutes:
+        raise ValueError(f"неизвестный интервал {interval!r}")
+    names = [str(t).upper() for t in tickers if str(t).strip()]
+    if not names:
+        raise ValueError("нужен хотя бы один тикер")
+
+    bars = []
+    missing = []
+    for ticker in names:
+        entry = marketdata.resolve(ticker)
+        if not entry:
+            missing.append(ticker)
+            continue
+        summary = marketdata.candles(
+            client(), entry["uid"], interval, days, name=ticker
+        )
+        bars.extend(load_csv(Path(summary["file"]), ticker, minutes))
+    if missing:
+        raise ValueError(
+            f"нет в справочнике: {', '.join(missing)}. Сначала find_instrument."
+        )
+    if not bars:
+        raise ValueError("история пустая — проверь интервал и глубину")
+
+    spec = Spec(
+        family=family, lookback=lookback, stop_atr=stop_atr, target_atr=target_atr
+    )
+    campaign = f"{family}:{interval}:{','.join(sorted(names))}"
+    period = f"{min(b.start for b in bars).date()}..{max(b.start for b in bars).date()}"
+    protocol = Protocol()
+    trials.open_campaign(
+        campaign,
+        f"есть ли преимущество у семейства {family} на этих бумагах",
+        names, period, asdict(protocol),
+    )
+    # Попытка записывается ДО расчёта: иначе неудачные варианты исчезали бы
+    # из знаменателя, а порог считался бы как для одной проверки.
+    trials.register(campaign, spec.version, spec.to_dict())
+    registered = trials.count(campaign)
+
+    report = evaluate(
+        [spec], bars, registered, protocol, Costs(), Rules(capital=config.STARTING_CAPITAL)
+    )
+    report["campaign"] = campaign
+    report["period"] = period
+    report["universe"] = names
+    trials.finish(campaign, spec.version, {
+        "net": report.get("net"), "verdict": report.get("verdict")
+    })
+
+    path = marketdata.data_dir() / f"backtest_{spec.version}.json"
+    path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=1, default=str), encoding="utf-8"
+    )
+
+    answer = {
+        "verdict": report["verdict"],
+        "file": str(path),
+        "spec_version": spec.version,
+        "campaign": campaign,
+        "period": period,
+        "net": report.get("net"),
+        "net_pct": report.get("net_pct"),
+        "oos": report.get("oos"),
+        "oos_sessions": report.get("oos_sessions"),
+        "positive_folds": report.get("positive_folds"),
+        "stress": report.get("stress"),
+        "baselines": report.get("baselines"),
+        "bootstrap_lower_mean": (report.get("bootstrap") or {}).get("lower_mean"),
+        "registered_trials": registered,
+        "failed_gates": report.get("failed_gates"),
+        "trading_allowed": False,
+    }
+    if register_as:
+        oos = report.get("oos") or {}
+        answer["playbook"] = journal.register_playbook(
+            {
+                "name": register_as,
+                "entry": f"{family}, lookback {lookback}, стоп {stop_atr} ATR, "
+                         f"цель {target_atr} ATR",
+                "invalidation": "средний результат вне обучения перестаёт быть выше нуля",
+                "measured_on": f"{interval}, {period}, бумаги: {', '.join(names)}",
+                "trades": int(oos.get("trades") or 0),
+                "wins": int(oos.get("wins") or 0),
+                "avg_r": float(oos.get("avg_r") or 0.0),
+                "source": "evaluator",
+                "evidence": {"file": str(path), "version": spec.version,
+                             "trials": registered, "verdict": report["verdict"]},
+            }
+        )
+    return answer
 
 
 @tool(

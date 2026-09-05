@@ -99,6 +99,26 @@ class Playbooks(JournalCase):
             guards.check_playbook("test", limit + 1)
         self.assertIn("на проверке", str(caught.exception))
 
+    def test_свои_слова_не_дают_полного_размера(self):
+        """Числа, записанные агентом, остаются на проверке навсегда.
+
+        Реестр хранит и то, откуда взялась статистика. Запись со слов не
+        становится измерением от того, что цифры выглядят убедительно.
+        """
+        add_playbook(trades=200, wins=140, avg_r=0.9, source="manual")
+        record = journal.playbook("test")
+        self.assertEqual(record["status"], "probation")
+        with self.assertRaises(guards.GuardRejection) as caught:
+            guards.check_playbook("test", config.MAX_RISK_PER_TRADE)
+        self.assertIn("с твоих слов", str(caught.exception))
+
+    def test_неизвестный_источник_отбивается(self):
+        with self.assertRaises(ValueError):
+            journal.register_playbook(
+                {"name": "x", "entry": "a", "invalidation": "b", "measured_on": "c",
+                 "trades": 1, "wins": 1, "avg_r": 0.1, "source": "внушает-доверие"}
+            )
+
     def test_отрицательная_база_не_даёт_полного_размера(self):
         # Сделок хватает, но средний результат отрицательный.
         add_playbook(trades=40, wins=10, avg_r=-0.3)
