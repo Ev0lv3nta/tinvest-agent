@@ -28,7 +28,7 @@ class JournalCase(unittest.TestCase):
         for table in (
             "tool_calls", "orders", "snapshots", "wakeups", "events",
             "transcript", "messages", "kv", "order_intents", "usage", "watches",
-            "playbooks",
+            "playbooks", "mandates",
         ):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
@@ -156,7 +156,7 @@ class FakeBroker:
             "raw": {},
         }
 
-    def cancel_order(self, order_id: str) -> str:
+    def cancel_order(self, order_id: str, by_request_id: bool = False) -> str:
         self.active = [o for o in self.active if o.get("order_id") != order_id]
         return "2026-08-24T12:00:00Z"
 

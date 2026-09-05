@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import fcntl
 import json
 import math
 import re
@@ -285,11 +287,10 @@ def _resolve_intent(intent, ticker: str) -> str:
         return f"состояние заявки не читается ({exc})"
 
     status = state.get("status") or ""
+    exchange_id = state.get("order_id") or order_id or request_id
+    _recover_order(intent, state, exchange_id, status)
     journal.update_order_status(
-        state.get("order_id") or order_id or request_id,
-        status,
-        state.get("lots_executed") or 0,
-        state.get("price") or 0.0,
+        exchange_id, status, state.get("lots_executed") or 0, state.get("price") or 0.0
     )
     if journal.is_terminal(status):
         journal.set_intent_state(
@@ -320,6 +321,43 @@ _INTENT_BY_STATUS = {
 }
 
 
+def _recover_order(intent, state: dict, exchange_id: str, status: str) -> None:
+    """Записать заявку, о которой мы узнали только из ответа на запрос.
+
+    Если ответ на отправку потерялся, `log_order` не вызывался и заявки в
+    журнале нет. Когда она потом находится у брокера, обновлять нечего:
+    UPDATE молча не трогает ни одной строки, а позиция при этом уже есть.
+    Дальше её не видят ни дневные лимиты, ни расчёт совокупного риска, ни
+    сверка — то есть сделка существует только на счёте.
+    """
+    if journal.order_exists(exchange_id):
+        return
+    journal.log_order(
+        {
+            "order_id": exchange_id,
+            "request_id": intent["request_id"],
+            "instrument_id": intent["instrument_id"],
+            "figi": state.get("figi") or "",
+            "ticker": intent["ticker"] or "",
+            "direction": intent["direction"],
+            "order_type": intent["order_type"],
+            "lots": intent["lots"],
+            "lots_executed": state.get("lots_executed") or 0,
+            "price": state.get("price") or 0.0,
+            "requested_price": intent["price"],
+            "total": state.get("total") or 0.0,
+            "status": status,
+            "card": json.loads(intent["card"]) if intent["card"] else None,
+            "raw": {"recovered": True},
+        },
+        rationale="восстановлена по ответу брокера: отправка прошла, ответ не дошёл",
+    )
+    journal.log_event(
+        "order_recovered",
+        {"request_id": intent["request_id"], "order_id": exchange_id, "status": status},
+    )
+
+
 def _fill_evidence(intent) -> str:
     """Есть ли по бумаге исполненная операция в ту же сторону после намерения.
 
@@ -330,9 +368,12 @@ def _fill_evidence(intent) -> str:
     Направление сравнивается обязательно. Раньше подходила любая операция по
     бумаге, и исполненная продажа закрывала неопределённую покупку.
     """
-    ticker = marketdata.ticker_for(intent["instrument_id"]) or ""
-    info = marketdata.resolve(ticker) or {}
-    figi = info.get("figi", "")
+    ticker = intent["ticker"] or marketdata.ticker_for(intent["instrument_id"]) or ""
+    figi = (marketdata.resolve(ticker) or {}).get("figi", "")
+    if not figi:
+        # Без FIGI операцию не с чем сопоставить: подошла бы любая по счёту.
+        # Совпадение со всем подряд — не совпадение, это незнание.
+        return "unknown"
     want = intent["direction"]
     try:
         operations = client().operations(1)
@@ -360,7 +401,53 @@ def _iso_ts(value: str) -> float:
         return 0.0
 
 
+# Счётом в каждый момент распоряжается кто-то один. Блокировка файловая, а
+# не в памяти процесса: заявку отправляет и шлюз по просьбе модели, и
+# сторож позиций из супервизора — это разные процессы, и `threading.Lock`
+# между ними ничего не значит. Два процесса увидели бы одни и те же
+# свободные деньги и оба прошли бы проверку.
+ACCOUNT_LOCK = Path(config.DB_PATH).parent / "account.lock"
+
+
+@contextlib.contextmanager
+def account_lock(timeout: float = 30.0):
+    ACCOUNT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    handle = ACCOUNT_LOCK.open("a+")
+    deadline = time.time() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    raise GuardRejection(
+                        "Счёт занят другой операцией дольше "
+                        f"{timeout:.0f} с. Повтори чуть позже: одновременных "
+                        "заявок по одному счёту быть не должно."
+                    )
+                time.sleep(0.2)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _order(
+    direction: str,
+    instrument_id: str,
+    lots: int,
+    price,
+    rationale: str,
+    card: dict | None = None,
+) -> dict:
+    with account_lock():
+        return _order_locked(direction, instrument_id, lots, price, rationale, card)
+
+
+def _order_locked(
     direction: str,
     instrument_id: str,
     lots: int,
@@ -503,9 +590,59 @@ def _order(
         },
         rationale=rationale,
     )
+    if buying:
+        # Обязательство создаётся сразу после отправки, а не после
+        # исполнения: лимитка может исполниться в любой момент, а позиция
+        # без стопа не должна существовать даже минуту.
+        journal.add_mandate(
+            {
+                "instrument_id": instrument_id,
+                "ticker": ticker,
+                "request_id": request_id,
+                "stop": float(card["stop"]),
+                "target": float(card["target"]),
+                "deadline_ts": _deadline(card),
+            }
+        )
+    if not buying:
+        _close_mandate_if_flat(api, instrument_id, ticker)
     if checks:
         result["checks"] = checks
     return result
+
+
+# Сколько живёт идея, если срок не назван. Позиция без срока — это позиция,
+# про которую забыли: тезис или сработал, или не сработал, а «подождём ещё»
+# не является третьим исходом.
+DEFAULT_HOLD_HOURS = 8
+
+
+def _deadline(card: dict) -> float:
+    hours = card.get("hold_hours")
+    try:
+        hours = float(hours) if hours else DEFAULT_HOLD_HOURS
+    except (TypeError, ValueError):
+        hours = DEFAULT_HOLD_HOURS
+    hours = max(0.25, min(hours, 24 * 14))
+    return time.time() + hours * 3600
+
+
+def _close_mandate_if_flat(api, instrument_id: str, ticker: str) -> None:
+    """После продажи проверить, осталась ли позиция. Нет — снять обязательство."""
+    try:
+        portfolio = api.portfolio()
+    except Exception:  # noqa: BLE001 — не смогли проверить, оставляем как есть
+        return
+    left = next(
+        (
+            position.get("quantity") or 0
+            for position in portfolio.get("positions", [])
+            if position.get("instrument_id") == instrument_id
+        ),
+        0,
+    )
+    if left <= 0:
+        journal.close_mandate_for(instrument_id, "позиция закрыта")
 
 
 # --- инструменты ----------------------------------------------------------
@@ -541,6 +678,20 @@ def _obj(properties: dict, required: list[str] | None = None) -> dict:
 def tool_portfolio() -> dict:
     data = client().portfolio()
     journal.log_snapshot(data["total"], data["cash"], data["positions"])
+    # К каждой позиции — действующее обязательство: стоп, цель и срок, по
+    # которым из неё выйдет код, если ты не успеешь.
+    for position in data["positions"]:
+        mandate = journal.mandate_for(position.get("instrument_id") or "")
+        if mandate is None:
+            continue
+        position["mandate"] = {
+            "stop": mandate["stop"],
+            "target": mandate["target"],
+            "deadline": datetime.fromtimestamp(
+                mandate["deadline_ts"], tz=MSK
+            ).strftime("%d.%m %H:%M") if mandate["deadline_ts"] else None,
+            "latched": bool(mandate["latched_ts"]),
+        }
     data["result_vs_start"] = round(data["total"] - config.STARTING_CAPITAL, 2)
     data["result_percent"] = round(
         (data["total"] / config.STARTING_CAPITAL - 1) * 100, 2
@@ -808,7 +959,12 @@ def tool_max_lots(instrument_id: str, price: float | None = None) -> dict:
             "target": {"type": "number", "description": "первая цель по цене"},
             "playbook": {
                 "type": "string",
-                "description": "класс сетапа из notes/playbooks.md",
+                "description": "имя сетапа из реестра (playbooks)",
+            },
+            "hold_hours": {
+                "type": "number",
+                "description": "сколько часов живёт идея; по умолчанию 8. "
+                               "По истечении срока позиция закрывается кодом",
             },
             "rationale": {
                 "type": "string",
@@ -826,6 +982,7 @@ def tool_buy(
     playbook: str,
     rationale: str,
     price: float | None = None,
+    hold_hours: float | None = None,
 ) -> dict:
     if not str(playbook).strip():
         raise ValueError("playbook обязателен: торгуются только зарегистрированные сетапы")
@@ -833,6 +990,7 @@ def tool_buy(
         "stop": float(stop),
         "target": float(target),
         "playbook": str(playbook)[:80],
+        "hold_hours": hold_hours,
     }
     return _order("ORDER_DIRECTION_BUY", instrument_id, lots, price, rationale, card)
 
@@ -877,9 +1035,14 @@ def tool_cancel_order(order_id: str) -> dict:
     что исполнено ноль: часть могла уйти, пока запрос шёл. Поэтому после
     отмены состояние читается точно, а не записывается по факту отправки.
     """
-    cancelled_at = client().cancel_order(order_id)
-    intent = journal.intent_by_request(order_id)
-    result: dict[str, Any] = {"cancelled_at": cancelled_at}
+    with account_lock():
+        intent = journal.intent_by_request(order_id)
+        cancelled_at = client().cancel_order(order_id, by_request_id=bool(intent))
+        result: dict[str, Any] = {"cancelled_at": cancelled_at}
+        return _after_cancel(order_id, intent, result)
+
+
+def _after_cancel(order_id: str, intent, result: dict) -> dict:
     try:
         state = client().order_state(order_id, by_request_id=bool(intent))
     except TInvestError as exc:
@@ -917,6 +1080,33 @@ def tool_cancel_order(order_id: str) -> dict:
             f"изменилась, свободные лоты пересчитай по portfolio."
         )
     return result
+
+
+@tool(
+    "tighten_stop",
+    "Подтянуть стоп по открытой позиции вверх. Опустить нельзя: условие, "
+    "записанное до сигнала, внутри дня не смягчается — иначе позиция падает "
+    "дальше, чем было решено, когда думалось спокойно.\n"
+    "Стоп исполняет код: если цена его пройдёт, позиция закроется без твоего "
+    "участия, даже если ты в этот момент занят другим.",
+    _obj({"instrument_id": {"type": "string"}, "stop": {"type": "number"}},
+         ["instrument_id", "stop"]),
+)
+def tool_tighten_stop(instrument_id: str, stop: float) -> dict:
+    if not math.isfinite(float(stop)) or float(stop) <= 0:
+        raise ValueError("стоп должен быть конечным положительным числом")
+    mandate = journal.tighten_mandate(instrument_id, float(stop))
+    if mandate is None:
+        raise ValueError(
+            "по этой бумаге нет открытого обязательства — позиции нет либо "
+            "она уже закрыта"
+        )
+    return {
+        "ticker": mandate["ticker"],
+        "stop": mandate["stop"],
+        "target": mandate["target"],
+        "latched": bool(mandate["latched_ts"]),
+    }
 
 
 @tool(
@@ -1458,11 +1648,6 @@ def tool_send_report(summary: str, path: str) -> dict:
 
 _WRITE_LOCK = threading.Lock()
 
-# Заявки сериализуются между собой: два параллельных вызова могли бы
-# увидеть одни и те же свободные деньги и оба пройти проверку.
-_ORDER_LOCK = threading.Lock()
-SERIALIZED = {"buy", "sell", "cancel_order"}
-
 # Поиск занимает в среднем сорок секунд и до трёх минут по таймауту. При
 # строго последовательной обработке всё это время тот же процесс не
 # обслуживал ни портфель, ни продажу, ни снятие заявки.
@@ -1530,11 +1715,7 @@ def _call_tool(name: str, arguments: dict) -> tuple[bool, Any]:
 def _handle_call(request_id, params: dict) -> None:
     name = params.get("name", "")
     arguments = params.get("arguments") or {}
-    if name in SERIALIZED:
-        with _ORDER_LOCK:
-            ok, payload = _call_tool(name, arguments)
-    else:
-        ok, payload = _call_tool(name, arguments)
+    ok, payload = _call_tool(name, arguments)
     _send(
         {
             "jsonrpc": "2.0",

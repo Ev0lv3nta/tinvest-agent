@@ -22,6 +22,7 @@ from gateway import config, journal, limits
 from supervisor import reconcile
 from supervisor.appserver import AppServer, AppServerError, Busy
 from supervisor.telegram import Bot
+from supervisor.keeper import Keeper
 from supervisor.watcher import Watcher
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -171,6 +172,7 @@ class Supervisor:
         self.last_reconcile = 0.0
         self.last_deadman = 0.0
         self.watcher: Watcher | None = None
+        self.keeper: Keeper | None = None
         # Экземплярные, а не классовые: изменяемые атрибуты класса — ловушка.
         self._seen_methods: set[str] = set()
         self._reasoning: dict[str, dict] = {}
@@ -843,6 +845,13 @@ class Supervisor:
             client_factory=reconcile.client,
         )
         self.watcher.start()
+        # Сторож позиций не зависит ни от календаря, ни от того, жив ли
+        # канал к модели: стоп исполняется кодом.
+        self.keeper = Keeper(
+            client_factory=reconcile.client,
+            notify=lambda text: self.bot.send(text, keyboard=False),
+        )
+        self.keeper.start()
 
         while self.running:
             try:
@@ -867,6 +876,8 @@ class Supervisor:
 
         if self.watcher:
             self.watcher.stop()
+        if self.keeper:
+            self.keeper.stop()
         self.codex.stop()
         journal.log_event("supervisor_stop", {})
 

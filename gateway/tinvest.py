@@ -407,8 +407,18 @@ class SandboxClient:
             "raw": raw,
         }
 
-    def cancel_order(self, order_id: str) -> str:
-        raw = self._sandbox("CancelSandboxOrder", {"orderId": order_id})
+    def cancel_order(self, order_id: str, by_request_id: bool = False) -> str:
+        """Снять заявку. Идентификатор бывает двух видов, и брокер должен
+        знать, какой из них передан: наш ключ или его собственный."""
+        raw = self._sandbox(
+            "CancelSandboxOrder",
+            {
+                "orderId": order_id,
+                "orderIdType": (
+                    "ORDER_ID_TYPE_REQUEST" if by_request_id else "ORDER_ID_TYPE_EXCHANGE"
+                ),
+            },
+        )
         return raw.get("time", "")
 
     def active_orders(self) -> list[dict]:

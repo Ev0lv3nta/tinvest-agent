@@ -153,6 +153,29 @@ CREATE TABLE IF NOT EXISTS watches (
 );
 CREATE INDEX IF NOT EXISTS idx_watches_active ON watches(fired_ts, cancelled, expires_ts);
 
+-- Обязательство по позиции: цена, ниже которой из неё выходят, цель и срок
+-- жизни идеи. Живёт в базе, а не в голове модели: стоп, который исполняется
+-- только когда агент проснулся и вспомнил о нём, стопом не является.
+--
+-- `latched_ts` — момент, когда условие сработало. Оно защёлкивается до
+-- отправки заявки и переживает перезапуск: вернувшаяся назад цена не
+-- отменяет уже принятого решения выйти.
+CREATE TABLE IF NOT EXISTS mandates (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts    REAL    NOT NULL,
+    instrument_id TEXT    NOT NULL,
+    ticker        TEXT,
+    request_id    TEXT,
+    stop          REAL    NOT NULL,
+    target        REAL,
+    deadline_ts   REAL,
+    latched_ts    REAL,
+    latched_why   TEXT,
+    closed_ts     REAL,
+    closed_why    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mandates_open ON mandates(closed_ts, instrument_id);
+
 -- Реестр сетапов. Торговать можно только то, что зарегистрировано ДО сделки
 -- и измерено числами. Раньше «плейбук» и «базовая ставка» были двумя
 -- непустыми строками в заявке: подходило и несуществующее имя, и текст
@@ -760,6 +783,14 @@ def has_open_entry(instrument_id: str) -> bool:
     return sold is None or sold < bought
 
 
+def order_exists(order_id: str) -> bool:
+    conn = connect()
+    row = conn.execute(
+        "SELECT 1 FROM orders WHERE order_id = ?", (order_id,)
+    ).fetchone()
+    return row is not None
+
+
 def open_risk() -> float:
     """Плановый риск всего, что сейчас на столе.
 
@@ -839,6 +870,113 @@ def open_orders() -> list[sqlite3.Row]:
         "SELECT * FROM orders WHERE closed_ts IS NULL AND ts > ? ORDER BY ts",
         (time.time() - 7 * 86400,),
     ).fetchall()
+
+
+# --- обязательства по позициям --------------------------------------------
+
+
+def add_mandate(record: dict) -> int:
+    """Записать обязательство при входе. Одно на бумагу."""
+    conn = connect()
+    with conn:
+        conn.execute(
+            "UPDATE mandates SET closed_ts = ?, closed_why = 'заменено новым входом'"
+            " WHERE instrument_id = ? AND closed_ts IS NULL",
+            (time.time(), record["instrument_id"]),
+        )
+        cursor = conn.execute(
+            "INSERT INTO mandates (created_ts, instrument_id, ticker, request_id,"
+            " stop, target, deadline_ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                time.time(),
+                record["instrument_id"],
+                record.get("ticker", ""),
+                record.get("request_id", ""),
+                float(record["stop"]),
+                float(record["target"]) if record.get("target") else None,
+                record.get("deadline_ts"),
+            ),
+        )
+    log_event("mandate_added", {"ticker": record.get("ticker"), "stop": record["stop"]})
+    return int(cursor.lastrowid)
+
+
+def open_mandates() -> list[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM mandates WHERE closed_ts IS NULL ORDER BY created_ts"
+    ).fetchall()
+
+
+def mandate_for(instrument_id: str) -> Optional[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM mandates WHERE instrument_id = ? AND closed_ts IS NULL"
+        " ORDER BY created_ts DESC LIMIT 1",
+        (instrument_id,),
+    ).fetchone()
+
+
+def latch_mandate(mandate_id: int, why: str) -> None:
+    """Защёлкнуть требование выйти. Пишется ДО заявки и переживает перезапуск.
+
+    Без этого сбой между срабатыванием и отправкой означал бы, что условие
+    забыто: цена вернулась выше стопа, и следующая проверка ничего не
+    находит — хотя решение выйти уже было принято.
+    """
+    conn = connect()
+    with conn:
+        conn.execute(
+            "UPDATE mandates SET latched_ts = COALESCE(latched_ts, ?), latched_why = ?"
+            " WHERE id = ? AND latched_ts IS NULL",
+            (time.time(), why[:300], mandate_id),
+        )
+    log_event("mandate_latched", {"id": mandate_id, "why": why[:200]})
+
+
+def tighten_mandate(instrument_id: str, stop: float) -> Optional[sqlite3.Row]:
+    """Стоп можно только подтянуть вверх.
+
+    Внутри дня записанное до сигнала условие не смягчается: опустить стоп
+    значит дать позиции падать дальше, чем было решено, когда думалось
+    спокойно.
+    """
+    current = mandate_for(instrument_id)
+    if current is None:
+        return None
+    if stop <= float(current["stop"]):
+        raise ValueError(
+            f"стоп можно только подтянуть: сейчас {current['stop']}, "
+            f"запрошено {stop}. Ослабить условие внутри дня нельзя — "
+            f"перенеси разговор на вечерний разбор."
+        )
+    conn = connect()
+    with conn:
+        conn.execute("UPDATE mandates SET stop = ? WHERE id = ?", (stop, current["id"]))
+    log_event(
+        "mandate_tightened",
+        {"ticker": current["ticker"], "was": current["stop"], "now": stop},
+    )
+    return mandate_for(instrument_id)
+
+
+def close_mandate(mandate_id: int, why: str) -> None:
+    conn = connect()
+    with conn:
+        conn.execute(
+            "UPDATE mandates SET closed_ts = ?, closed_why = ? WHERE id = ?",
+            (time.time(), why[:300], mandate_id),
+        )
+
+
+def close_mandate_for(instrument_id: str, why: str) -> None:
+    conn = connect()
+    with conn:
+        conn.execute(
+            "UPDATE mandates SET closed_ts = ?, closed_why = ?"
+            " WHERE instrument_id = ? AND closed_ts IS NULL",
+            (time.time(), why[:300], instrument_id),
+        )
 
 
 # --- реестр сетапов -------------------------------------------------------
