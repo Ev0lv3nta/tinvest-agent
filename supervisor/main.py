@@ -831,9 +831,38 @@ class Supervisor:
             source="system",
         )
 
+    def recover(self) -> None:
+        """Сверка до торговли: что осталось невыясненным после прошлой жизни.
+
+        Процесс мог упасть между записью намерения и ответом брокера. Пока
+        судьба такой заявки неизвестна, вход по бумаге закрыт, и выяснять
+        это лучше на старте, чем в момент, когда агент решил купить.
+        """
+        try:
+            report = reconcile.recover_intents()
+        except Exception as exc:  # noqa: BLE001 — старт не должен падать на сверке
+            journal.log_event("recover_failed", {"error": repr(exc)[:300]})
+            self.bot.send(f"⚠️ Сверка намерений на старте не прошла: {exc}", keyboard=False)
+            return
+        if not report["blocked"]:
+            return
+        lines = ["⚠️ <b>Незакрытые заявки с прошлого запуска</b>", ""]
+        for item in report["blocked"]:
+            lines.append(f"{item['ticker']} · {item['request_id'][:8]} — {item['why']}")
+        lines.append("")
+        lines.append("Вход по этим бумагам закрыт, пока судьба заявки не выяснена.")
+        self.bot.send("\n".join(lines), keyboard=False)
+        journal.enqueue_message(
+            "На старте нашлись незакрытые заявки прошлого запуска: "
+            + "; ".join(f"{i['ticker']} — {i['why']}" for i in report["blocked"])
+            + ". Разберись через order_state до любых новых входов.",
+            source="system",
+        )
+
     def run(self) -> None:
         journal.log_event("supervisor_start", {})
         self.bot.set_commands()
+        self.recover()
         self.start_codex()
         self.reset_live_state()
         self.bot.send("▶️ Супервизор запущен, сессия агента активна.")

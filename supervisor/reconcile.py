@@ -113,6 +113,41 @@ def sync_orders() -> int:
     return changed
 
 
+def recover_intents() -> dict:
+    """Выяснить судьбу всех незакрытых намерений до начала торговли.
+
+    Восстановление начинается со сверки, а не с новых сделок. Процесс мог
+    упасть между записью намерения и ответом брокера; заявка при этом могла
+    исполниться. Пока это не выяснено, вход по бумаге закрыт — и лучше
+    выяснить один раз на старте, чем в момент, когда агент решил купить.
+
+    Ничего не «истекает»: то, что осталось невыясненным, остаётся
+    блокирующим и попадает в отчёт оператору.
+    """
+    from gateway import server
+
+    pending = journal.blocking_intents()
+    if not pending:
+        return {"checked": 0, "resolved": 0, "blocked": []}
+
+    resolved = 0
+    blocked = []
+    for intent in pending:
+        ticker = intent["ticker"] or intent["instrument_id"][:8]
+        try:
+            why = server._resolve_intent(intent, ticker)
+        except Exception as exc:  # noqa: BLE001 — восстановление не должно падать
+            why = f"проверить не удалось ({type(exc).__name__}: {exc})"
+        if why:
+            blocked.append({"request_id": intent["request_id"], "ticker": ticker, "why": why})
+        else:
+            resolved += 1
+
+    report = {"checked": len(pending), "resolved": resolved, "blocked": blocked}
+    journal.log_event("intents_recovered", report)
+    return report
+
+
 def _lot_size(figi: str, instrument_id: str) -> int:
     """Размер лота, чтобы сравнивать штуки с лотами.
 

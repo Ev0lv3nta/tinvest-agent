@@ -575,3 +575,57 @@ class ProtocolShapes(JournalCase):
 
         self.assertNotIn("usage", ("completedAt", "durationMs", "error", "id",
                                    "items", "itemsView", "startedAt", "status"))
+
+
+class Recovery(JournalCase):
+    """Восстановление начинается со сверки, а не с новых сделок."""
+
+    def setUp(self):
+        super().setUp()
+        from gateway import server
+        from tests.support import FakeBroker, flat_bars
+
+        self.broker = FakeBroker(bars=flat_bars())
+        server._client = self.broker
+        reconcile._client = self.broker
+
+    def intent(self, request_id="r1"):
+        journal.create_intent({
+            "request_id": request_id, "instrument_id": "uid", "ticker": "TEST",
+            "direction": "buy", "order_type": "market", "lots": 1,
+        })
+
+    def test_нечего_проверять(self):
+        self.assertEqual(reconcile.recover_intents()["checked"], 0)
+
+    def test_невыясненное_остаётся_блокирующим(self):
+        from gateway.tinvest import TInvestError
+
+        self.intent()
+        self.broker.state_error = TInvestError("нет связи", retryable=True, answered=False)
+        report = reconcile.recover_intents()
+        self.assertEqual(report["resolved"], 0)
+        self.assertEqual(len(report["blocked"]), 1)
+        self.assertEqual(len(journal.blocking_intents()), 1)
+
+    def test_исполнившаяся_заявка_записывается_в_журнал(self):
+        """Заявка, чей ответ на отправку потерялся, существует только на счёте.
+
+        UPDATE по несуществующей строке молча не делает ничего, и такая
+        сделка не видна ни дневным лимитам, ни расчёту риска, ни сверке.
+        """
+        self.intent()
+        conn = journal.connect()
+        conn.execute("UPDATE order_intents SET ts = ts - 600")
+        conn.commit()
+        self.broker.states["r1"] = {
+            "status": "EXECUTION_REPORT_STATUS_FILL", "order_id": "exch-77",
+            "lots_requested": 1, "lots_executed": 1, "price": 100.0,
+        }
+        report = reconcile.recover_intents()
+        self.assertEqual(report["resolved"], 1)
+        row = conn.execute("SELECT * FROM orders WHERE order_id='exch-77'").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["lots_executed"], 1)
+        self.assertEqual(row["ticker"], "TEST")
+        self.assertEqual(journal.blocking_intents(), [])
