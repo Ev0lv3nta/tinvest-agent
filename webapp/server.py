@@ -77,16 +77,16 @@ def valid_telegram(init_data: str) -> bool:
     if issued <= 0 or time.time() - issued > INIT_DATA_MAX_AGE:
         return False
 
-    if OPERATOR_ID:
-        try:
-            user_id = str((json.loads(fields.get("user", "{}")) or {}).get("id", ""))
-        except ValueError:
-            return False
-        # Подпись подтверждает лишь то, что человек открыл мини-приложение
-        # этого бота. Оператор — конкретный человек.
-        if user_id != str(OPERATOR_ID):
-            return False
-    return True
+    # Подпись подтверждает лишь то, что человек открыл мини-приложение этого
+    # бота, — а бота может открыть кто угодно, кто нашёл его в поиске. Пока
+    # не сказано, кто именно оператор, доступа нет ни у кого.
+    if not OPERATOR_ID:
+        return False
+    try:
+        user_id = str((json.loads(fields.get("user", "{}")) or {}).get("id", ""))
+    except ValueError:
+        return False
+    return user_id == str(OPERATOR_ID)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -121,17 +121,23 @@ class Handler(BaseHTTPRequestHandler):
             status,
         )
 
-    def _authorized(self, query: dict) -> bool:
+    def _authorized(self) -> bool:
         """Без настроенного доступа — не пускаем никого.
 
         Раньше пустой WEBAPP_KEY открывал панель целиком, включая отправку
         сообщений агенту: любой, кто дотянулся до порта, мог им управлять.
+
+        Ключ принимается только заголовком. Строка запроса попадает в логи
+        сервера, в историю браузера и в Referer при переходе на внешний
+        ресурс — то есть ключ утекает туда, куда его никто не отправлял.
+        Ссылкой с `?k=` панель по-прежнему открывается: страница забирает
+        ключ из адреса, убирает его оттуда и дальше носит заголовком.
         """
         if valid_telegram(self.headers.get("X-Telegram-Init-Data", "")):
             return True
         if not ACCESS_KEY:
             return False
-        supplied = self.headers.get("X-Panel-Key") or query.get("k", [""])[0]
+        supplied = self.headers.get("X-Panel-Key") or ""
         # Сравниваем байты: compare_digest на строках падает на любом
         # не-ASCII символе, и подобранный ключ ронял бы запрос в 500.
         return hmac.compare_digest(
@@ -346,7 +352,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path.startswith("/api/"):
-            if not self._authorized(query):
+            if not self._authorized():
                 return self._json({"error": "доступ запрещён"}, 403)
             try:
                 if path == "/api/state":
@@ -377,10 +383,14 @@ class Handler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         if parsed.path != "/api/say":
             return self._json({"error": "нет такого метода"}, 404)
-        if not self._authorized(query):
+        if not self._authorized():
             return self._json({"error": "доступ запрещён"}, 403)
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length < 0:
+                # Отрицательная длина в rfile.read означает «до конца потока»:
+                # тело читалось бы без ограничения размера.
+                return self._json({"error": "неверная длина тела"}, 400)
             if length > MAX_BODY:
                 return self._json({"error": "слишком длинное сообщение"}, 413)
             payload = json.loads(self.rfile.read(length) or b"{}")

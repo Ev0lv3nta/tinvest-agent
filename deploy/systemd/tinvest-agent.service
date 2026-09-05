@@ -15,6 +15,9 @@ Environment=PYTHONUNBUFFERED=1
 Environment=AGENT_DB=/home/agent/state/agent.db
 Environment=AGENT_WORKDIR=/home/agent/work
 Environment=AGENT_DATA_DIR=/home/agent/data
+# Реестр попыток лежит отдельно от торгового журнала: исследованию незачем
+# открывать файл, в котором заявки.
+Environment=RESEARCH_DB=/home/agent/state/research.db
 Environment=HOME=/home/agent
 ExecStart=/usr/bin/python3 -m supervisor.main
 Restart=always

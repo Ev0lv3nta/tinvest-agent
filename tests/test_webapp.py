@@ -40,14 +40,41 @@ class Auth(JournalCase):
     def test_без_ключа_доступ_закрыт(self):
         self.webapp.ACCESS_KEY = ""
         self.tearDownKey = True
-        self.assertFalse(self.handler._authorized({}))
+        self.assertFalse(self.handler._authorized())
 
     def test_ключ_в_заголовке_работает(self):
         self.handler.headers = {"X-Panel-Key": "secret"}
-        self.assertTrue(self.handler._authorized({}))
+        self.assertTrue(self.handler._authorized())
 
     def test_чужой_ключ_отклоняется(self):
-        self.assertFalse(self.handler._authorized({"k": ["другой"]}))
+        self.handler.headers = {"X-Panel-Key": "другой"}
+        self.assertFalse(self.handler._authorized())
+
+    def test_ключ_из_строки_запроса_не_принимается(self):
+        """Строка запроса оседает в логах, истории браузера и Referer.
+
+        Страница забирает ключ из ссылки один раз и дальше носит заголовком.
+        Сам обработчик API строку запроса как источник ключа не принимает.
+        """
+        self.handler.headers = {}
+        self.handler.path = "/api/state?k=secret"
+        self.assertFalse(self.handler._authorized())
+
+    def test_без_оператора_подпись_не_пускает(self):
+        """Подпись доказывает, что бот тот же, а не что человек тот самый.
+
+        Бота может открыть кто угодно, кто нашёл его в поиске. Пока не
+        сказано, кто именно оператор, доступа нет ни у кого.
+        """
+        self.webapp.OPERATOR_ID = ""
+        signed = sign({"auth_date": str(int(time.time())),
+                       "user": json.dumps({"id": 12345})})
+        self.assertFalse(self.webapp.valid_telegram(signed))
+
+    def test_чужой_пользователь_не_пускается(self):
+        signed = sign({"auth_date": str(int(time.time())),
+                       "user": json.dumps({"id": 12345})})
+        self.assertFalse(self.webapp.valid_telegram(signed))
 
     def test_подпись_проверяется(self):
         good = sign({"auth_date": str(int(time.time())), "user": json.dumps({"id": 777})})
