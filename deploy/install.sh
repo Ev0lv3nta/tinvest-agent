@@ -46,8 +46,11 @@ if [ ! -d "$WORK/.git" ]; then
         && git add -A && git commit -q -m 'Исходные инструкции и скиллы'"
 fi
 
-install -D -o agent -g agent -m 600 "$REPO/deploy/codex-config.toml" \
-    /home/agent/.codex/config.toml
+# Повторная установка сохраняет выбранную модель и endpoint оператора.
+if [ ! -f /home/agent/.codex/config.toml ]; then
+    install -D -o agent -g agent -m 600 "$REPO/deploy/codex-config.toml" \
+        /home/agent/.codex/config.toml
+fi
 
 for unit in tinvest-agent tinvest-panel omniroute-tunnel tinvest-backup; do
     install -D -m 644 "$REPO/deploy/systemd/$unit.service" \

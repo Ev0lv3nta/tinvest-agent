@@ -7,3 +7,8 @@ __pycache__/
 *.log
 .env
 .DS_Store
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+work/
