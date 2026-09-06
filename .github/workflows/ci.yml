@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Тесты
+        run: python3 -m unittest discover -t . -s tests -q
+      - name: Демо на синтетических данных
+        run: |
+          python3 -m research demo > demo.json
+          python3 -c 'import json; r = json.load(open("demo.json")); assert r["verdict"] == "преимущество не подтверждено", r'
+      - name: Синтаксис скриптов установки
+        run: bash -n deploy/install.sh deploy/push.sh

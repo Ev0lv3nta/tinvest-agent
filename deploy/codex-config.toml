@@ -12,7 +12,7 @@ sandbox_mode = "danger-full-access"
 model_reasoning_summary = "detailed"
 
 [model_providers.omniroute]
-name = "OmniRoute USA"
+name = "Model gateway"
 # Прямой SSH-туннель на локальный порт. Cloudflare Quick Tunnel отваливался
 # по нескольку раз в сутки и больше не используется.
 base_url = "http://127.0.0.1:20128/v1"
