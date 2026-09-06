@@ -44,8 +44,17 @@ python3 -c "import sys; sys.path.insert(0,'.'); from gateway import server; \
     print(f'   шлюз импортируется, инструментов: {len(server.TOOLS)}')"
 python3 -m unittest discover -t . -s tests -q 2>&1 | tail -2
 
-echo "   останавливаю супервизор"
-systemctl stop tinvest-agent
+# Раскатка не воскрешает то, что остановили намеренно. Агента ставят на
+# паузу решением человека, и обновление кода этого решения не отменяет.
+WAS_RUNNING=no
+systemctl is-active --quiet tinvest-agent && WAS_RUNNING=yes
+
+if [ "$WAS_RUNNING" = yes ]; then
+    echo "   останавливаю супервизор"
+    systemctl stop tinvest-agent
+else
+    echo "   супервизор и так остановлен — оставляю остановленным"
+fi
 
 PREV="$REMOTE.prev"
 rm -rf "$PREV"
@@ -53,7 +62,11 @@ mv "$REMOTE" "$PREV"
 mv "$STAGE" "$REMOTE"
 chown -R root:root "$REMOTE"; chmod -R a+rX "$REMOTE"
 
-if systemctl start tinvest-agent && sleep 5 && systemctl is-active --quiet tinvest-agent; then
+if [ "$WAS_RUNNING" != yes ]; then
+    systemctl restart tinvest-panel
+    echo "   код обновлён, предыдущая версия в $PREV"
+    echo "   агент остаётся остановленным: systemctl start tinvest-agent — когда решишь"
+elif systemctl start tinvest-agent && sleep 5 && systemctl is-active --quiet tinvest-agent; then
     systemctl restart tinvest-panel
     echo "   запущено, предыдущая версия в $PREV"
 else
@@ -65,4 +78,5 @@ fi
 ONREMOTE
 
 echo "4. Проверка снаружи"
-$SSH "$TARGET" 'systemctl is-active omniroute-tunnel tinvest-panel tinvest-agent'
+$SSH "$TARGET" 'systemctl is-active omniroute-tunnel tinvest-panel; \
+    echo "агент: $(systemctl is-active tinvest-agent)"'

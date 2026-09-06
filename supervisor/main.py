@@ -22,6 +22,7 @@ from gateway import config, journal, limits
 from supervisor import reconcile
 from supervisor.appserver import AppServer, AppServerError, Busy
 from supervisor.telegram import Bot
+from supervisor.keeper import Keeper
 from supervisor.watcher import Watcher
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -105,6 +106,15 @@ def session_name(moment: datetime | None = None) -> str:
 
 
 def market_open(moment: datetime | None = None) -> bool:
+    """Общий календарь: подсказка о частоте опроса, а не право торговать.
+
+    Календарь грубый — суббота и воскресенье считаются выходными целиком,
+    хотя на Мосбирже есть выходные сессии по отдельным инструментам.
+    Поэтому от него не должно зависеть ничего, что управляет риском:
+    наблюдатели за ценой, сверка и выходы работают независимо. Правду о
+    конкретной бумаге даёт её `trading_status`, а заявку вне сессии отобьёт
+    сам брокер кодом 30079.
+    """
     return session_name(moment) not in ("выходной", "вне торгов")
 
 
@@ -162,6 +172,7 @@ class Supervisor:
         self.last_reconcile = 0.0
         self.last_deadman = 0.0
         self.watcher: Watcher | None = None
+        self.keeper: Keeper | None = None
         # Экземплярные, а не классовые: изменяемые атрибуты класса — ловушка.
         self._seen_methods: set[str] = set()
         self._reasoning: dict[str, dict] = {}
@@ -820,9 +831,38 @@ class Supervisor:
             source="system",
         )
 
+    def recover(self) -> None:
+        """Сверка до торговли: что осталось невыясненным после прошлой жизни.
+
+        Процесс мог упасть между записью намерения и ответом брокера. Пока
+        судьба такой заявки неизвестна, вход по бумаге закрыт, и выяснять
+        это лучше на старте, чем в момент, когда агент решил купить.
+        """
+        try:
+            report = reconcile.recover_intents()
+        except Exception as exc:  # noqa: BLE001 — старт не должен падать на сверке
+            journal.log_event("recover_failed", {"error": repr(exc)[:300]})
+            self.bot.send(f"⚠️ Сверка намерений на старте не прошла: {exc}", keyboard=False)
+            return
+        if not report["blocked"]:
+            return
+        lines = ["⚠️ <b>Незакрытые заявки с прошлого запуска</b>", ""]
+        for item in report["blocked"]:
+            lines.append(f"{item['ticker']} · {item['request_id'][:8]} — {item['why']}")
+        lines.append("")
+        lines.append("Вход по этим бумагам закрыт, пока судьба заявки не выяснена.")
+        self.bot.send("\n".join(lines), keyboard=False)
+        journal.enqueue_message(
+            "На старте нашлись незакрытые заявки прошлого запуска: "
+            + "; ".join(f"{i['ticker']} — {i['why']}" for i in report["blocked"])
+            + ". Разберись через order_state до любых новых входов.",
+            source="system",
+        )
+
     def run(self) -> None:
         journal.log_event("supervisor_start", {})
         self.bot.set_commands()
+        self.recover()
         self.start_codex()
         self.reset_live_state()
         self.bot.send("▶️ Супервизор запущен, сессия агента активна.")
@@ -830,11 +870,17 @@ class Supervisor:
         poller = threading.Thread(target=self._poll_telegram, daemon=True)
         poller.start()
         self.watcher = Watcher(
-            on_fire=self._watches_fired,
             market_open=market_open,
             client_factory=reconcile.client,
         )
         self.watcher.start()
+        # Сторож позиций не зависит ни от календаря, ни от того, жив ли
+        # канал к модели: стоп исполняется кодом.
+        self.keeper = Keeper(
+            client_factory=reconcile.client,
+            notify=lambda text: self.bot.send(text, keyboard=False),
+        )
+        self.keeper.start()
 
         while self.running:
             try:
@@ -859,18 +905,10 @@ class Supervisor:
 
         if self.watcher:
             self.watcher.stop()
+        if self.keeper:
+            self.keeper.stop()
         self.codex.stop()
         journal.log_event("supervisor_stop", {})
-
-    @staticmethod
-    def _watches_fired(texts: list[str]) -> None:
-        """Срабатывание кладётся в durable-очередь, а не доставляется сразу.
-
-        Поток наблюдателя не должен зависеть от состояния канала: если он
-        лежит, событие подождёт в базе и уйдёт позже.
-        """
-        for text in texts:
-            journal.enqueue_message(text, source="watch")
 
     def _poll_telegram(self) -> None:
         """Long-polling с отступом при отказах.

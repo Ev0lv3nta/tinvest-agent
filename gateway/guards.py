@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Optional
 
@@ -205,6 +206,101 @@ def check_positions(
 # --- экономика сделки -----------------------------------------------------
 
 
+def check_playbook(name: str, risk_rub: float) -> dict:
+    """Торгуется только зарегистрированный сетап, и размером по его статусу.
+
+    Раньше требовались две непустые строки: имя сетапа и «базовая ставка».
+    Проходило и несуществующее имя, и текст вместо статистики — то есть
+    проверка была на длину строки, а не на существование измерения.
+
+    Регистрация обязана предшествовать сделке. Сетап, придуманный в момент
+    входа, не является основанием: он не отличим от объяснения задним числом.
+    """
+    record = journal.playbook(name)
+    if record is None:
+        known = ", ".join(item["name"] for item in journal.playbooks()) or "ни одного"
+        raise GuardRejection(
+            f"Отклонено: сетап {name!r} не зарегистрирован. Зарегистрированы: "
+            f"{known}.\nСетап регистрируется до сделки через register_playbook: "
+            f"условие входа, условие опровержения, на чём измерена статистика, "
+            f"число сделок, попаданий и средний результат в R. Пока измерения "
+            f"нет, входа нет — иначе объяснение пишется задним числом."
+        )
+    if record["status"] == "retired":
+        raise GuardRejection(
+            f"Отклонено: сетап {name!r} снят с торговли — {record['retired_why']}. "
+            f"Красивый график не отменяет отрицательной базы. Если появились "
+            f"новые данные, перерегистрируй его с обновлённой статистикой."
+        )
+    if record["status"] == "probation":
+        limit = config.MAX_RISK_PER_TRADE * config.PROBATION_RISK_FRACTION
+        if risk_rub > limit:
+            if record.get("source") != "evaluator":
+                why = (
+                    "статистика записана с твоих слов. Числа в реестре не "
+                    "становятся измерением от того, что их туда записали — "
+                    "полный размер даёт прогон через backtest, который считает "
+                    "их тем же кодом"
+                )
+            else:
+                why = (
+                    f"{record['trades']} сделок при пороге "
+                    f"{journal.PLAYBOOK_MIN_TRADES}, средний результат "
+                    f"{record['avg_r']}R"
+                )
+            raise GuardRejection(
+                f"Отклонено: сетап {name!r} на проверке — {why}. Такие "
+                f"торгуются четвертью размера: риск не больше {limit:.0f} ₽, "
+                f"запрошено {risk_rub:.0f} ₽."
+            )
+    return record
+
+
+def check_no_pyramiding(portfolio: dict, instrument_id: str, ticker: str) -> None:
+    """Второй вход в ту же бумагу — это не вторая идея, а увеличение первой.
+
+    Риск считается по карточке одного входа, поэтому две покупки одного
+    тезиса проходят порознь и складываются уже в позиции. Наращивание
+    требует пересчёта стопа по всей позиции, а этого механизма здесь нет.
+    """
+    held = any(
+        position.get("instrument_id") == instrument_id
+        and (position.get("quantity") or 0) > 0
+        for position in portfolio.get("positions", [])
+    )
+    # Срез брокера отстаёт от исполнения, поэтому спрашиваем и журнал.
+    if not held and not journal.has_open_entry(instrument_id):
+        return
+    raise GuardRejection(
+        f"Отклонено: позиция в {ticker} уже есть. Добавление к открытой "
+        f"позиции здесь запрещено: риск посчитан по стопу первого входа, а "
+        f"после долива его пришлось бы пересчитывать на всю позицию. Если "
+        f"тезис изменился — выйди и войди заново с новой карточкой."
+    )
+
+
+def check_portfolio_heat(new_risk: float, open_risk: float, ticker: str) -> None:
+    """Риск считается по портфелю, а не по одной сделке.
+
+    Потолок в 1R на сделку сам по себе ничего не ограничивает: две идеи по
+    900 ₽ проходят каждая, а на столе уже 1800 ₽. Две сильно связанные
+    бумаги при этом выбивает одним движением рынка, то есть «два независимых
+    риска» оказываются одним.
+    """
+    total = new_risk + open_risk
+    if total <= config.MAX_PORTFOLIO_RISK:
+        return
+    left = max(config.MAX_PORTFOLIO_RISK - open_risk, 0.0)
+    raise GuardRejection(
+        f"Отклонено: под риском уже {open_risk:.0f} ₽, новая позиция в {ticker} "
+        f"добавляет {new_risk:.0f} ₽ — вместе {total:.0f} ₽ при потолке "
+        f"{config.MAX_PORTFOLIO_RISK:.0f} ₽ "
+        f"({config.MAX_PORTFOLIO_RISK / config.RISK_UNIT:.0f}R на портфель). "
+        f"Свободно {left:.0f} ₽: либо уменьши размер, либо закрой то, во что "
+        f"веришь меньше. Стопы по разным бумагам могут сработать в один день."
+    )
+
+
 def check_trade_card(
     entry: float,
     stop: float,
@@ -219,8 +315,23 @@ def check_trade_card(
     Проверяются до сделки именно потому, что после сделки их проверяет рынок,
     и это дороже.
     """
+    for name, value in (("вход", entry), ("стоп", stop), ("цель", target)):
+        # Бесконечность и NaN проходят любое сравнение «больше нуля», а
+        # дальше делают барьеры декоративными: при бесконечной цели
+        # отношение прибыли к риску бесконечно, и три проверки подряд
+        # отвечают «да». Объявленная в схеме типизация вызов не проверяет —
+        # это делает код.
+        if not math.isfinite(value):
+            raise GuardRejection(
+                f"Цена ({name}) должна быть конечным числом, получено {value!r}. "
+                f"Карточка сделки — это измерение, а не декларация."
+            )
     if not (entry > 0 and stop > 0 and target > 0):
         raise GuardRejection("Цены входа, стопа и цели должны быть положительными.")
+    if not isinstance(lots, int) or lots <= 0:
+        raise GuardRejection(
+            f"Количество лотов должно быть целым положительным, получено {lots!r}."
+        )
     if stop >= entry:
         raise GuardRejection(
             f"Стоп {stop} не ниже входа {entry}. Здесь только длинные позиции: "

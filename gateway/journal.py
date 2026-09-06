@@ -152,6 +152,53 @@ CREATE TABLE IF NOT EXISTS watches (
     cancelled     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_watches_active ON watches(fired_ts, cancelled, expires_ts);
+
+-- Обязательство по позиции: цена, ниже которой из неё выходят, цель и срок
+-- жизни идеи. Живёт в базе, а не в голове модели: стоп, который исполняется
+-- только когда агент проснулся и вспомнил о нём, стопом не является.
+--
+-- `latched_ts` — момент, когда условие сработало. Оно защёлкивается до
+-- отправки заявки и переживает перезапуск: вернувшаяся назад цена не
+-- отменяет уже принятого решения выйти.
+CREATE TABLE IF NOT EXISTS mandates (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts    REAL    NOT NULL,
+    instrument_id TEXT    NOT NULL,
+    ticker        TEXT,
+    request_id    TEXT,
+    stop          REAL    NOT NULL,
+    target        REAL,
+    deadline_ts   REAL,
+    latched_ts    REAL,
+    latched_why   TEXT,
+    closed_ts     REAL,
+    closed_why    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mandates_open ON mandates(closed_ts, instrument_id);
+
+-- Реестр сетапов. Торговать можно только то, что зарегистрировано ДО сделки
+-- и измерено числами. Раньше «плейбук» и «базовая ставка» были двумя
+-- непустыми строками в заявке: подходило и несуществующее имя, и текст
+-- «выглядит перспективно» вместо статистики.
+CREATE TABLE IF NOT EXISTS playbooks (
+    name         TEXT    PRIMARY KEY,
+    created_ts   REAL    NOT NULL,
+    updated_ts   REAL    NOT NULL,
+    entry        TEXT    NOT NULL,
+    invalidation TEXT    NOT NULL,
+    measured_on  TEXT    NOT NULL,
+    trades       INTEGER NOT NULL,
+    wins         INTEGER NOT NULL,
+    avg_r        REAL    NOT NULL,
+    retired      INTEGER NOT NULL DEFAULT 0,
+    retired_why  TEXT,
+    -- Откуда взялись числа: 'evaluator' — посчитал код по истории одним и
+    -- тем же прогоном; 'manual' — записал агент со своих слов. Второе
+    -- остаётся на проверке навсегда: слова не становятся измерением от
+    -- того, что их записали в таблицу.
+    source       TEXT NOT NULL DEFAULT 'manual',
+    evidence     TEXT
+);
 """
 
 # Столбцы, добавленные после первой схемы. В SQLite нет ADD COLUMN IF NOT
@@ -163,6 +210,9 @@ MIGRATIONS = [
     ("orders", "requested_price", "REAL"),
     ("orders", "card", "TEXT"),
     ("orders", "closed_ts", "REAL"),
+    ("order_intents", "order_id", "TEXT"),
+    ("playbooks", "source", "TEXT NOT NULL DEFAULT 'manual'"),
+    ("playbooks", "evidence", "TEXT"),
     ("watches", "base_price", "REAL"),
     ("watches", "url", "TEXT"),
     ("watches", "content_hash", "TEXT"),
@@ -449,24 +499,58 @@ def day_start_ts(now: Optional[float] = None) -> float:
     return ((moment + MSK_OFFSET) // 86400) * 86400 - MSK_OFFSET
 
 
-def day_open_equity() -> Optional[float]:
-    """Стоимость портфеля на начало торгового дня.
+DAY_BASE_KEY = "day_base"
 
-    Берётся первый срез после полуночи; если сегодня срезов ещё не было —
-    последний вчерашний. Если нет и его, дневной лимит не применяется:
-    лучше не ограничивать, чем ограничивать по выдуманному числу.
+
+def day_open_equity() -> Optional[float]:
+    """Стоимость портфеля, от которой считается результат дня.
+
+    База — последний срез ПРЕДЫДУЩЕГО дня, а не первый срез сегодняшнего.
+    Разница в том, попадает ли ночной разрыв в дневной результат. Раньше не
+    попадал: позиция уезжала за ночь на пять тысяч вниз, первый утренний
+    срез записывал это как новую точку отсчёта, и дневной стоп начинал день
+    с чистого листа — ровно после самого дорогого события.
+
+    Зафиксированная база не пересчитывается до конца дня: иначе её сдвигал
+    бы любой следующий срез. Меняет её только внешний поток денег.
     """
     conn = connect()
     start = day_start_ts()
-    row = conn.execute(
-        "SELECT total FROM snapshots WHERE ts >= ? ORDER BY ts LIMIT 1", (start,)
-    ).fetchone()
-    if row:
-        return float(row["total"])
+    stored = kv_get(DAY_BASE_KEY, "")
+    if stored:
+        try:
+            saved = json.loads(stored)
+            if float(saved.get("day", 0)) == start:
+                return float(saved["total"])
+        except (ValueError, TypeError, KeyError):
+            pass
+
     row = conn.execute(
         "SELECT total FROM snapshots WHERE ts < ? ORDER BY ts DESC LIMIT 1", (start,)
     ).fetchone()
-    return float(row["total"]) if row else None
+    if row is None:
+        # Первый день прогона: предыдущего дня просто нет.
+        row = conn.execute(
+            "SELECT total FROM snapshots WHERE ts >= ? ORDER BY ts LIMIT 1", (start,)
+        ).fetchone()
+    if row is None:
+        return None
+    total = float(row["total"])
+    kv_set(DAY_BASE_KEY, json.dumps({"day": start, "total": total}))
+    return total
+
+
+def adjust_day_base(delta: float) -> None:
+    """Внешний поток денег не является результатом торговли.
+
+    Пополнение счёта сдвигает базу на ту же величину, иначе оно выглядело бы
+    прибылью, а вывод — убытком, и дневной стоп срабатывал бы от перевода.
+    """
+    base = day_open_equity()
+    if base is None:
+        return
+    kv_set(DAY_BASE_KEY, json.dumps({"day": day_start_ts(), "total": base + delta}))
+    log_event("day_base_adjusted", {"delta": delta, "base": base + delta})
 
 
 def day_result(total: float) -> Optional[float]:
@@ -537,33 +621,69 @@ def create_intent(intent: dict) -> None:
     conn.commit()
 
 
-def set_intent_state(request_id: str, state: str, detail: str = "") -> None:
+def set_intent_state(
+    request_id: str, state: str, detail: str = "", order_id: str = ""
+) -> None:
+    """Состояние намерения. `order_id` — биржевой идентификатор заявки.
+
+    Свой ключ и биржевой — разные вещи: по первому мы ищем заявку у брокера,
+    по второму брокер её сам называет. Храним оба, чтобы не гадать, чья
+    строка лежит в поле.
+    """
     conn = connect()
-    conn.execute(
-        "UPDATE order_intents SET state = ?, detail = ? WHERE request_id = ?",
-        (state, detail[:500] if detail else None, request_id),
-    )
+    if order_id:
+        conn.execute(
+            "UPDATE order_intents SET state = ?, detail = ?, order_id = ?"
+            " WHERE request_id = ?",
+            (state, detail[:500] if detail else None, order_id, request_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE order_intents SET state = ?, detail = ? WHERE request_id = ?",
+            (state, detail[:500] if detail else None, request_id),
+        )
     conn.commit()
 
 
-# Состояния, при которых новую заявку по бумаге отправлять нельзя: либо мы
-# не знаем судьбу предыдущей, либо знаем, что она висит активной.
-BLOCKING_STATES = ("ambiguous", "live")
+def intent_by_order(order_id: str) -> Optional[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM order_intents WHERE order_id = ?", (order_id,)
+    ).fetchone()
+
+
+# Состояния намерения, в которых его судьба выяснена окончательно.
+# Всё остальное — включая записанное перед сетью `pending` — блокирует
+# новую заявку по той же бумаге в ту же сторону.
+#
+# Раньше блокировали только два состояния, и `pending` в них не входило.
+# Падение процесса ровно на отправке оставляло намерение, которое не мешало
+# ничему: заявка могла висеть у брокера, а шлюз разрешал вторую.
+RESOLVED_STATES = ("filled", "rejected", "cancelled", "not_placed")
+
+# Заявка отправлена и брокер её принял: пока она не дошла до конечного
+# состояния, вторая заявка в ту же сторону — это удвоение позиции.
+ACTIVE_STATES = ("pending", "sent", "live", "unknown", "ambiguous")
 
 
 def blocking_intents(instrument_id: str = "") -> list[sqlite3.Row]:
-    """Намерения, мешающие отправить новую заявку по этой бумаге."""
+    """Намерения, мешающие отправить новую заявку по этой бумаге.
+
+    Список строится от обратного: блокирует всё, что не разрешено. Новое
+    состояние, добавленное когда-нибудь позже, по умолчанию окажется
+    блокирующим, а не тихо пропускающим заявку.
+    """
     conn = connect()
-    marks = ",".join("?" * len(BLOCKING_STATES))
+    marks = ",".join("?" * len(RESOLVED_STATES))
     if instrument_id:
         return conn.execute(
-            f"SELECT * FROM order_intents WHERE state IN ({marks})"
+            f"SELECT * FROM order_intents WHERE state NOT IN ({marks})"
             f" AND instrument_id = ? ORDER BY ts",
-            (*BLOCKING_STATES, instrument_id),
+            (*RESOLVED_STATES, instrument_id),
         ).fetchall()
     return conn.execute(
-        f"SELECT * FROM order_intents WHERE state IN ({marks}) ORDER BY ts",
-        BLOCKING_STATES,
+        f"SELECT * FROM order_intents WHERE state NOT IN ({marks}) ORDER BY ts",
+        RESOLVED_STATES,
     ).fetchall()
 
 
@@ -588,30 +708,160 @@ def close_order(order_id: str, status: str) -> None:
     conn.commit()
 
 
+# Конечные состояния заявки перечислены явно, а не угадываются по подстроке.
+# Подстрока «FILL» совпадала с PARTIALLYFILL: частично исполненная заявка
+# получала closed_ts, переставала синхронизироваться и навсегда оставалась
+# наполовину исполненной, хотя остаток продолжал работать у брокера.
+TERMINAL_ORDER_STATUS = frozenset(
+    {
+        "EXECUTION_REPORT_STATUS_FILL",
+        "EXECUTION_REPORT_STATUS_REJECTED",
+        "EXECUTION_REPORT_STATUS_CANCELLED",
+    }
+)
+
+ACTIVE_ORDER_STATUS = frozenset(
+    {
+        "EXECUTION_REPORT_STATUS_NEW",
+        "EXECUTION_REPORT_STATUS_PARTIALLYFILL",
+    }
+)
+
+
+def is_terminal(status: str) -> bool:
+    return (status or "") in TERMINAL_ORDER_STATUS
+
+
 def update_order_status(order_id: str, status: str, lots_executed: int, price: float) -> None:
     """Довести запись о заявке до фактического состояния.
 
     Раньше сохранялся только первый ответ брокера: заявка, исполнившаяся
     позже, навсегда оставалась NEW с нулём исполненных лотов, а отмена не
     записывалась вовсе.
+
+    Исполненный объём только растёт: ответ брокера, пришедший не по порядку,
+    не должен уменьшать уже учтённое количество.
     """
     conn = connect()
     conn.execute(
-        "UPDATE orders SET status = ?, lots_executed = ?,"
+        "UPDATE orders SET status = ?, lots_executed = MAX(COALESCE(lots_executed, 0), ?),"
         " price = CASE WHEN ? > 0 THEN ? ELSE price END,"
-        " closed_ts = CASE WHEN ? THEN ? ELSE closed_ts END"
+        " closed_ts = CASE WHEN ? THEN COALESCE(closed_ts, ?) ELSE closed_ts END"
         " WHERE order_id = ?",
         (
             status,
             lots_executed,
             price,
             price,
-            1 if status and ("FILL" in status or "CANCELLED" in status or "REJECTED" in status) else 0,
+            1 if is_terminal(status) else 0,
             time.time(),
             order_id,
         ),
     )
     conn.commit()
+
+
+def has_open_entry(instrument_id: str) -> bool:
+    """Есть ли по бумаге незакрытый вход по нашим собственным записям.
+
+    Срез портфеля у брокера отстаёт: сразу после исполнения позиция в нём
+    может ещё не появиться, и проверка «уже держим» пропустит второй вход в
+    ту же идею. Журнал знает об исполнении раньше.
+    """
+    conn = connect()
+    row = conn.execute(
+        "SELECT direction, MAX(ts) AS ts FROM orders"
+        " WHERE instrument_id = ? AND COALESCE(lots_executed, 0) > 0"
+        " GROUP BY direction",
+        (instrument_id,),
+    ).fetchall()
+    moments = {item["direction"]: item["ts"] for item in row}
+    bought = moments.get("buy")
+    if bought is None:
+        return False
+    sold = moments.get("sell")
+    return sold is None or sold < bought
+
+
+def order_exists(order_id: str) -> bool:
+    conn = connect()
+    row = conn.execute(
+        "SELECT 1 FROM orders WHERE order_id = ?", (order_id,)
+    ).fetchone()
+    return row is not None
+
+
+def open_risk() -> float:
+    """Плановый риск всего, что сейчас на столе.
+
+    Считается по карточкам входов: для каждой бумаги, по которой есть
+    позиция или неразрешённое намерение на покупку, берётся риск последнего
+    входа. Проверка на сделку этого не видит — она смотрит на одну заявку и
+    пропускает обе идеи по отдельности.
+
+    Величина плановая: это потеря до стопа, а не обещанный максимум убытка.
+    Разрыв цены перепрыгивает стоп, и тогда факт будет больше.
+    """
+    conn = connect()
+    at_risk: set[str] = set()
+
+    flat: set[str] = set()
+    row = conn.execute("SELECT positions FROM snapshots ORDER BY ts DESC LIMIT 1").fetchone()
+    if row:
+        try:
+            for position in json.loads(row["positions"]):
+                instrument_id = position.get("instrument_id")
+                if not instrument_id:
+                    continue
+                if (position.get("quantity") or 0) > 0:
+                    at_risk.add(instrument_id)
+                else:
+                    # Явный ноль у брокера — это ответ «позиции нет».
+                    flat.add(instrument_id)
+        except (ValueError, TypeError):
+            pass
+
+    for intent in blocking_intents():
+        if intent["direction"] == "buy":
+            at_risk.add(intent["instrument_id"])
+
+    # Плюс то, что журнал уже считает купленным: срез брокера отстаёт.
+    for row in conn.execute(
+        "SELECT DISTINCT instrument_id FROM orders WHERE direction = 'buy'"
+        " AND COALESCE(lots_executed, 0) > 0 AND ts > ?",
+        (time.time() - 7 * 86400,),
+    ).fetchall():
+        if row["instrument_id"] not in flat and has_open_entry(row["instrument_id"]):
+            at_risk.add(row["instrument_id"])
+
+    total = 0.0
+    for instrument_id in at_risk:
+        total += max(
+            _card_risk(
+                conn.execute(
+                    "SELECT card FROM orders WHERE instrument_id = ? AND direction = 'buy'"
+                    " AND card IS NOT NULL ORDER BY ts DESC LIMIT 1",
+                    (instrument_id,),
+                ).fetchone()
+            ),
+            _card_risk(
+                conn.execute(
+                    "SELECT card FROM order_intents WHERE instrument_id = ?"
+                    " AND direction = 'buy' AND card IS NOT NULL ORDER BY ts DESC LIMIT 1",
+                    (instrument_id,),
+                ).fetchone()
+            ),
+        )
+    return round(total, 2)
+
+
+def _card_risk(row: Optional[sqlite3.Row]) -> float:
+    if row is None or not row["card"]:
+        return 0.0
+    try:
+        return float(json.loads(row["card"]).get("risk_rub") or 0.0)
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
 
 
 def open_orders() -> list[sqlite3.Row]:
@@ -620,6 +870,219 @@ def open_orders() -> list[sqlite3.Row]:
         "SELECT * FROM orders WHERE closed_ts IS NULL AND ts > ? ORDER BY ts",
         (time.time() - 7 * 86400,),
     ).fetchall()
+
+
+# --- обязательства по позициям --------------------------------------------
+
+
+def add_mandate(record: dict) -> int:
+    """Записать обязательство при входе. Одно на бумагу."""
+    conn = connect()
+    with conn:
+        conn.execute(
+            "UPDATE mandates SET closed_ts = ?, closed_why = 'заменено новым входом'"
+            " WHERE instrument_id = ? AND closed_ts IS NULL",
+            (time.time(), record["instrument_id"]),
+        )
+        cursor = conn.execute(
+            "INSERT INTO mandates (created_ts, instrument_id, ticker, request_id,"
+            " stop, target, deadline_ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                time.time(),
+                record["instrument_id"],
+                record.get("ticker", ""),
+                record.get("request_id", ""),
+                float(record["stop"]),
+                float(record["target"]) if record.get("target") else None,
+                record.get("deadline_ts"),
+            ),
+        )
+    log_event("mandate_added", {"ticker": record.get("ticker"), "stop": record["stop"]})
+    return int(cursor.lastrowid)
+
+
+def open_mandates() -> list[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM mandates WHERE closed_ts IS NULL ORDER BY created_ts"
+    ).fetchall()
+
+
+def mandate_for(instrument_id: str) -> Optional[sqlite3.Row]:
+    conn = connect()
+    return conn.execute(
+        "SELECT * FROM mandates WHERE instrument_id = ? AND closed_ts IS NULL"
+        " ORDER BY created_ts DESC LIMIT 1",
+        (instrument_id,),
+    ).fetchone()
+
+
+def latch_mandate(mandate_id: int, why: str) -> None:
+    """Защёлкнуть требование выйти. Пишется ДО заявки и переживает перезапуск.
+
+    Без этого сбой между срабатыванием и отправкой означал бы, что условие
+    забыто: цена вернулась выше стопа, и следующая проверка ничего не
+    находит — хотя решение выйти уже было принято.
+    """
+    conn = connect()
+    with conn:
+        conn.execute(
+            "UPDATE mandates SET latched_ts = COALESCE(latched_ts, ?), latched_why = ?"
+            " WHERE id = ? AND latched_ts IS NULL",
+            (time.time(), why[:300], mandate_id),
+        )
+    log_event("mandate_latched", {"id": mandate_id, "why": why[:200]})
+
+
+def tighten_mandate(instrument_id: str, stop: float) -> Optional[sqlite3.Row]:
+    """Стоп можно только подтянуть вверх.
+
+    Внутри дня записанное до сигнала условие не смягчается: опустить стоп
+    значит дать позиции падать дальше, чем было решено, когда думалось
+    спокойно.
+    """
+    current = mandate_for(instrument_id)
+    if current is None:
+        return None
+    if stop <= float(current["stop"]):
+        raise ValueError(
+            f"стоп можно только подтянуть: сейчас {current['stop']}, "
+            f"запрошено {stop}. Ослабить условие внутри дня нельзя — "
+            f"перенеси разговор на вечерний разбор."
+        )
+    conn = connect()
+    with conn:
+        conn.execute("UPDATE mandates SET stop = ? WHERE id = ?", (stop, current["id"]))
+    log_event(
+        "mandate_tightened",
+        {"ticker": current["ticker"], "was": current["stop"], "now": stop},
+    )
+    return mandate_for(instrument_id)
+
+
+def close_mandate(mandate_id: int, why: str) -> None:
+    conn = connect()
+    with conn:
+        conn.execute(
+            "UPDATE mandates SET closed_ts = ?, closed_why = ? WHERE id = ?",
+            (time.time(), why[:300], mandate_id),
+        )
+
+
+def close_mandate_for(instrument_id: str, why: str) -> None:
+    conn = connect()
+    with conn:
+        conn.execute(
+            "UPDATE mandates SET closed_ts = ?, closed_why = ?"
+            " WHERE instrument_id = ? AND closed_ts IS NULL",
+            (time.time(), why[:300], instrument_id),
+        )
+
+
+# --- реестр сетапов -------------------------------------------------------
+
+# Сколько наблюдений нужно, чтобы сетап считался проверенным. Число
+# инженерное, а не статистически достаточное: пятнадцать коррелированных
+# сделок одного дня — это не пятнадцать независимых наблюдений.
+PLAYBOOK_MIN_TRADES = 15
+
+
+def register_playbook(record: dict) -> dict:
+    """Записать или обновить сетап. Статус выводится из чисел, не объявляется."""
+    source = str(record.get("source") or "manual")
+    if source not in ("manual", "evaluator"):
+        raise ValueError(f"неизвестный источник статистики {source!r}")
+    conn = connect()
+    name = str(record["name"]).strip()[:80]
+    now = time.time()
+    row = conn.execute(
+        "SELECT created_ts FROM playbooks WHERE name = ?", (name,)
+    ).fetchone()
+    created = float(row["created_ts"]) if row else now
+    conn.execute(
+        "INSERT INTO playbooks (name, created_ts, updated_ts, entry, invalidation,"
+        " measured_on, trades, wins, avg_r, source, evidence)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(name) DO UPDATE SET updated_ts = excluded.updated_ts,"
+        " entry = excluded.entry, invalidation = excluded.invalidation,"
+        " measured_on = excluded.measured_on, trades = excluded.trades,"
+        " wins = excluded.wins, avg_r = excluded.avg_r,"
+        " source = excluded.source, evidence = excluded.evidence",
+        (
+            name,
+            created,
+            now,
+            str(record["entry"])[:600],
+            str(record["invalidation"])[:600],
+            str(record["measured_on"])[:600],
+            int(record["trades"]),
+            int(record["wins"]),
+            float(record["avg_r"]),
+            source,
+            _dump(record.get("evidence")) if record.get("evidence") else None,
+        ),
+    )
+    conn.commit()
+    log_event(
+        "playbook_registered",
+        {"name": name, "trades": int(record["trades"]), "source": source},
+    )
+    return playbook(name)
+
+
+def retire_playbook(name: str, why: str) -> None:
+    conn = connect()
+    conn.execute(
+        "UPDATE playbooks SET retired = 1, retired_why = ?, updated_ts = ? WHERE name = ?",
+        (why[:400], time.time(), name),
+    )
+    conn.commit()
+    log_event("playbook_retired", {"name": name, "why": why[:200]})
+
+
+def playbook(name: str) -> Optional[dict]:
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM playbooks WHERE name = ?", (str(name).strip()[:80],)
+    ).fetchone()
+    return _playbook_view(row) if row else None
+
+
+def playbooks() -> list[dict]:
+    conn = connect()
+    return [
+        _playbook_view(row)
+        for row in conn.execute("SELECT * FROM playbooks ORDER BY name").fetchall()
+    ]
+
+
+def _playbook_view(row: sqlite3.Row) -> dict:
+    trades, wins = int(row["trades"]), int(row["wins"])
+    source = row["source"] if "source" in row.keys() else "manual"
+    if row["retired"]:
+        status = "retired"
+    elif (
+        trades >= PLAYBOOK_MIN_TRADES
+        and float(row["avg_r"]) > 0
+        and source == "evaluator"
+    ):
+        status = "working"
+    else:
+        status = "probation"
+    return {
+        "name": row["name"],
+        "entry": row["entry"],
+        "invalidation": row["invalidation"],
+        "measured_on": row["measured_on"],
+        "trades": trades,
+        "wins": wins,
+        "hit_rate": round(wins / trades, 2) if trades else None,
+        "avg_r": round(float(row["avg_r"]), 2),
+        "status": status,
+        "source": source,
+        "retired_why": row["retired_why"] or "",
+        "updated_ts": row["updated_ts"],
+    }
 
 
 # --- расход модели --------------------------------------------------------
@@ -730,13 +1193,24 @@ def set_watch_hash(watch_id: int, content_hash: str) -> None:
     conn.commit()
 
 
-def mark_watch_fired(watch_id: int, value: float) -> None:
+def fire_watch(watch_id: int, value: float, text: str) -> None:
+    """Снять наблюдатель и поставить сообщение в очередь одной транзакцией.
+
+    Раздельно это две записи с зазором между ними: наблюдатель уже снят, а
+    сообщение ещё не поставлено. Падение в этот момент теряет событие
+    навсегда — наблюдатель больше не сработает, потому что уже сработал.
+    """
     conn = connect()
-    conn.execute(
-        "UPDATE watches SET fired_ts = ?, fired_value = ? WHERE id = ?",
-        (time.time(), value, watch_id),
-    )
-    conn.commit()
+    moment = time.time()
+    with conn:
+        conn.execute(
+            "UPDATE watches SET fired_ts = ?, fired_value = ? WHERE id = ?",
+            (moment, value, watch_id),
+        )
+        conn.execute(
+            "INSERT INTO messages (ts, source, text) VALUES (?, ?, ?)",
+            (moment, "watch", text),
+        )
 
 
 def expire_watches() -> int:

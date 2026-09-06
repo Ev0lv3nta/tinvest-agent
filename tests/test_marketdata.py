@@ -9,6 +9,44 @@ from gateway import config, marketdata, server
 from tests.support import FakeBroker, JournalCase, flat_bars
 
 
+class Completeness(JournalCase):
+    """Незакрытый бар — не наблюдение: он ещё изменится."""
+
+    def bars(self):
+        bars = flat_bars(30, price=100.0, spread=1.0)
+        bars[-1] = {**bars[-1], "close": 200.0, "high": 200.0, "complete": False}
+        return bars
+
+    def test_признак_переживает_файл(self):
+        broker = FakeBroker(bars=self.bars())
+        summary = marketdata.candles(
+            broker, "uid", "CANDLE_INTERVAL_DAY", 40, name="CMP", refresh=True
+        )
+        self.assertEqual(summary["bars"], 30)
+        self.assertEqual(summary["closed_bars"], 29)
+        self.assertFalse(summary["last_bar_complete"])
+        rows = marketdata.read_csv(Path(summary["file"]))
+        self.assertFalse(rows[-1]["complete"])
+        self.assertTrue(rows[-2]["complete"])
+
+    def test_опора_берёт_последний_закрытый_день(self):
+        broker = FakeBroker(bars=self.bars())
+        ref = marketdata.reference(broker, "CMP2", "uid")
+        # Незакрытый бар с ценой 200 в опору не попадает.
+        self.assertEqual(ref["prev_close"], 100.0)
+
+    def test_закрытый_последний_бар_не_отрезается(self):
+        """После закрытия торгов последний бар завершён и он же опорный.
+
+        Раньше последний бар отрезался безусловно, и в выходные «вчерашним
+        закрытием» становилось позавчерашнее.
+        """
+        bars = flat_bars(30, price=100.0, spread=1.0)
+        bars[-1] = {**bars[-1], "close": 150.0, "complete": True}
+        ref = marketdata.reference(FakeBroker(bars=bars), "CMP3", "uid")
+        self.assertEqual(ref["prev_close"], 150.0)
+
+
 class Summary(unittest.TestCase):
     def test_сводка_вместо_серии(self):
         broker = FakeBroker(bars=flat_bars(980, price=1000.0, spread=2.0))
@@ -20,7 +58,7 @@ class Summary(unittest.TestCase):
         self.assertLess(len(text), 1500)
         self.assertEqual(summary["bars"], 980)
         self.assertTrue(Path(summary["file"]).is_file())
-        self.assertEqual(summary["columns"], "time,open,high,low,close,volume")
+        self.assertEqual(summary["columns"], "time,open,high,low,close,volume,complete")
 
     def test_файл_читается_обратно(self):
         broker = FakeBroker(bars=flat_bars(30))

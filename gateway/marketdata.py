@@ -49,7 +49,27 @@ INTERVAL_MINUTES = {
     "CANDLE_INTERVAL_MONTH": 30 * 1440,
 }
 
-CSV_HEADER = ["time", "open", "high", "low", "close", "volume"]
+# Признак завершённости — часть наблюдения, а не служебное поле. Пока бар
+# не закрыт, его максимум, минимум и закрытие ещё изменятся, и считать по
+# нему уровень или ATR нельзя.
+# Сколько дней брокер отдаёт за один запрос. Измерено на песочнице
+# 05.09.2026; за границей приходит «The maximum request period for the given
+# candle interval has been exceeded», а не пустой ответ.
+MAX_DAYS_PER_REQUEST = {
+    "CANDLE_INTERVAL_1_MIN": 1,
+    "CANDLE_INTERVAL_2_MIN": 1,
+    "CANDLE_INTERVAL_3_MIN": 1,
+    "CANDLE_INTERVAL_5_MIN": 1,
+    "CANDLE_INTERVAL_10_MIN": 7,
+    "CANDLE_INTERVAL_15_MIN": 14,
+    "CANDLE_INTERVAL_30_MIN": 30,
+    "CANDLE_INTERVAL_HOUR": 90,
+    "CANDLE_INTERVAL_2_HOUR": 90,
+    "CANDLE_INTERVAL_4_HOUR": 120,
+    "CANDLE_INTERVAL_DAY": 1825,
+}
+
+CSV_HEADER = ["time", "open", "high", "low", "close", "volume", "complete"]
 
 # Открытие основной сессии. Диапазон первых тридцати минут — опорный уровень
 # для внутридневной работы, поэтому считается всегда.
@@ -177,6 +197,7 @@ def read_csv(path: Path) -> list[dict]:
         rows = list(csv.DictReader(handle))
     out = []
     for row in rows:
+        raw = row.get("complete")
         out.append(
             {
                 "time": row.get("time", ""),
@@ -185,9 +206,19 @@ def read_csv(path: Path) -> list[dict]:
                 "low": _num(row.get("low")),
                 "close": _num(row.get("close")),
                 "volume": int(_num(row.get("volume"))),
+                # Бар считается закрытым, пока не сказано обратного: в
+                # файлах, записанных до появления столбца, значения просто
+                # нет, а живут они не дольше одного интервала. Настоящий
+                # клиент признак проставляет всегда.
+                "complete": str(raw) not in ("False", "false", "0"),
             }
         )
     return out
+
+
+def complete_bars(bars: list[dict]) -> list[dict]:
+    """Только закрытые бары. Считать признаки можно лишь по ним."""
+    return [bar for bar in bars if bar.get("complete", True)]
 
 
 def summarize(bars: list[dict], path: Path, interval: str, tail: int = 0) -> dict:
@@ -207,7 +238,11 @@ def summarize(bars: list[dict], path: Path, interval: str, tail: int = 0) -> dic
     high, low = max(highs), min(lows)
     span = high - low
     average_volume = sum(volumes) / len(volumes) if volumes else 0.0
-    noise = atr(bars, 14)
+    # ATR — мера шума, по которой отбивается слишком близкий стоп. Считать
+    # её по ещё формирующемуся бару значит занижать шум тем сильнее, чем
+    # раньше в интервале смотришь.
+    closed = complete_bars(bars)
+    noise = atr(closed, 14)
 
     summary: dict[str, Any] = {
         "file": str(path),
@@ -224,6 +259,8 @@ def summarize(bars: list[dict], path: Path, interval: str, tail: int = 0) -> dic
         "vwap": round(vwap(bars), 4),
         "atr14": round(noise, 4),
         "atr14_pct": round(noise / last_close * 100, 2) if last_close else 0.0,
+        "closed_bars": len(closed),
+        "last_bar_complete": bool(bars[-1].get("complete", True)),
         "volume_total": int(sum(volumes)),
         "last_bar_volume_x_avg": round(volumes[-1] / average_volume, 2)
         if average_volume
@@ -260,6 +297,13 @@ def candles(
     if interval not in INTERVAL_MINUTES:
         known = ", ".join(sorted(INTERVAL_MINUTES))
         raise ValueError(f"неизвестный интервал {interval!r}. Допустимые: {known}")
+    limit = MAX_DAYS_PER_REQUEST.get(interval)
+    if limit and days > limit:
+        raise ValueError(
+            f"за один запрос брокер отдаёт не больше {limit} дн для интервала "
+            f"{interval[16:].lower()}, запрошено {days}. Глубокая история "
+            f"качается окнами — для проверки на истории есть backtest."
+        )
 
     path = csv_path(name or instrument_id, interval, days)
     fresh = False
@@ -349,8 +393,10 @@ def reference(client, ticker: str, uid: str) -> dict:
 
     summary = candles(client, uid, "CANDLE_INTERVAL_DAY", 40, name=ticker)
     bars = read_csv(Path(summary["file"])) if summary.get("bars") else []
-    # Последний бар — сегодняшний и ещё формируется, опора берётся до него.
-    history = bars[:-1] if len(bars) > 1 else bars
+    # Опора — последний закрытый день. Раньше последний бар отрезался
+    # безусловно: в выходные и после закрытия торгов «вчерашним закрытием»
+    # становилось позавчерашнее, и от него считались все уровни.
+    history = complete_bars(bars)
     if not history:
         return {}
     volumes = [_num(b.get("volume")) for b in history[-20:]]

@@ -143,20 +143,39 @@ class Watches(JournalCase):
             def last_price(self, ids):
                 return [{"instrument_id": i, "price": 1024.0} for i in ids]
 
-        worker = watcher.Watcher(
-            on_fire=supervisor_main.Supervisor._watches_fired,
-            market_open=lambda: True,
-            client_factory=Client,
-        )
+        worker = watcher.Watcher(market_open=lambda: True, client_factory=Client)
         fired = worker.tick()
         self.assertEqual(len(fired), 1)
         self.assertIn("1025", fired[0])
         self.assertEqual(journal.active_watches(), [])
         self.assertEqual(len(journal.peek_messages()), 1)
 
-    def test_вне_торгов_не_срабатывает(self):
+    def test_календарь_не_отключает_наблюдение(self):
+        """Наблюдатель на уровне открытой позиции — это управление риском.
+
+        Раньше проверка отключалась целиком по признаку «суббота или
+        воскресенье». На Мосбирже есть выходные сессии по отдельным
+        инструментам, и календарь не должен запрещать выход из позиции.
+        Если бумага действительно не торгуется, цена просто не придёт.
+        """
         journal.add_watch("uid", "T", "price_below", 1025.0, "стоп", time.time() + 3600)
-        worker = watcher.Watcher(lambda t: None, lambda: False, lambda: None)
+
+        class Client:
+            def last_price(self, ids):
+                return [{"instrument_id": i, "price": 1000.0} for i in ids]
+
+        worker = watcher.Watcher(market_open=lambda: False, client_factory=Client)
+        self.assertEqual(len(worker.tick()), 1)
+        self.assertEqual(len(journal.peek_messages()), 1)
+
+    def test_нет_цены_нет_срабатывания(self):
+        journal.add_watch("uid", "T", "price_below", 1025.0, "стоп", time.time() + 3600)
+
+        class Silent:
+            def last_price(self, ids):
+                return []
+
+        worker = watcher.Watcher(market_open=lambda: False, client_factory=Silent)
         self.assertEqual(worker.tick(), [])
         self.assertEqual(len(journal.active_watches()), 1)
 
@@ -222,23 +241,78 @@ class Reconcile(JournalCase):
         self.broker.ops = [op(msk(9, 0), "OPERATION_TYPE_INPUT", "", 0)]
         self.assertEqual(reconcile.unexplained(), [])
 
-    def test_синхронизация_закрывает_исчезнувшую_заявку(self):
+    def test_синхронизация_закрывает_отменённую_заявку(self):
         add_order(ts=time.time(), order_id="A", lots_executed=0, lots=4, price=0.0)
-        self.broker.orders = []
+        self.broker.states["A"] = {"status": "EXECUTION_REPORT_STATUS_CANCELLED"}
         self.assertEqual(reconcile.sync_orders(), 1)
         row = journal.connect().execute("SELECT * FROM orders WHERE order_id='A'").fetchone()
         self.assertIn("CANCELLED", row["status"])
         self.assertIsNotNone(row["closed_ts"])
 
+    def test_исчезнувшая_заявка_не_объявляется_отменённой(self):
+        """Исчезновение из списка активных — не состояние заявки.
+
+        Раньше отсутствие в активных записывалось как отмена с нулевым
+        исполнением. Так же выглядела исполненная заявка, и так же — любой
+        сбой чтения, который возвращал пустой список целиком.
+        """
+        add_order(ts=time.time(), order_id="A", lots_executed=0, lots=4, price=0.0)
+        self.broker.states = {}
+        self.assertEqual(reconcile.sync_orders(), 0)
+        row = journal.connect().execute("SELECT * FROM orders WHERE order_id='A'").fetchone()
+        self.assertIsNone(row["closed_ts"])
+        events = journal.connect().execute(
+            "SELECT COUNT(*) AS n FROM events WHERE kind='order_missing'"
+        ).fetchone()
+        self.assertEqual(events["n"], 1)
+
+    def test_недоступность_не_закрывает_заявки(self):
+        from gateway.tinvest import TInvestError
+
+        add_order(ts=time.time(), order_id="A", lots_executed=0, lots=4, price=0.0)
+        self.broker.state_error = TInvestError("нет связи", retryable=True, answered=False)
+        self.assertEqual(reconcile.sync_orders(), 0)
+        row = journal.connect().execute("SELECT * FROM orders WHERE order_id='A'").fetchone()
+        self.assertIsNone(row["closed_ts"])
+
     def test_синхронизация_подхватывает_исполнение(self):
         add_order(ts=time.time(), order_id="B", lots_executed=0, lots=4, price=0.0)
-        self.broker.orders = [
-            {"order_id": "B", "status": "EXECUTION_REPORT_STATUS_FILL",
-             "lots_executed": 4, "price": 101.0}
-        ]
+        self.broker.states["B"] = {
+            "status": "EXECUTION_REPORT_STATUS_FILL", "lots_executed": 4, "price": 101.0
+        }
         reconcile.sync_orders()
         row = journal.connect().execute("SELECT * FROM orders WHERE order_id='B'").fetchone()
         self.assertEqual(row["lots_executed"], 4)
+
+    def test_частичное_исполнение_не_закрывает_заявку(self):
+        """PARTIALLYFILL содержит подстроку FILL, но заявка ещё работает."""
+        add_order(ts=time.time(), order_id="C", lots_executed=0, lots=4, price=0.0)
+        self.broker.states["C"] = {
+            "status": "EXECUTION_REPORT_STATUS_PARTIALLYFILL",
+            "lots_executed": 1, "price": 101.0,
+        }
+        reconcile.sync_orders()
+        row = journal.connect().execute("SELECT * FROM orders WHERE order_id='C'").fetchone()
+        self.assertEqual(row["lots_executed"], 1)
+        self.assertIsNone(row["closed_ts"])
+        # Остаток исполняется позже — запись должна это увидеть.
+        self.broker.states["C"] = {
+            "status": "EXECUTION_REPORT_STATUS_FILL", "lots_executed": 4, "price": 101.0
+        }
+        reconcile.sync_orders()
+        row = journal.connect().execute("SELECT * FROM orders WHERE order_id='C'").fetchone()
+        self.assertEqual(row["lots_executed"], 4)
+        self.assertIsNotNone(row["closed_ts"])
+
+    def test_исполненный_объём_не_уменьшается(self):
+        add_order(ts=time.time(), order_id="D", lots_executed=3, lots=4, price=100.0)
+        self.broker.states["D"] = {
+            "status": "EXECUTION_REPORT_STATUS_PARTIALLYFILL",
+            "lots_executed": 1, "price": 100.0,
+        }
+        reconcile.sync_orders()
+        row = journal.connect().execute("SELECT * FROM orders WHERE order_id='D'").fetchone()
+        self.assertEqual(row["lots_executed"], 3)
 
 
 def op(ts, kind, figi, quantity):
@@ -254,6 +328,8 @@ class FakeReconcileBroker:
     def __init__(self):
         self.ops: list[dict] = []
         self.orders: list[dict] = []
+        self.states: dict[str, dict] = {}
+        self.state_error = None
         self.lot = 1
 
     def operations(self, days=7):
@@ -261,6 +337,19 @@ class FakeReconcileBroker:
 
     def active_orders(self):
         return list(self.orders)
+
+    def order_state(self, order_id, by_request_id=False):
+        from gateway.tinvest import OrderNotFound
+
+        if self.state_error is not None:
+            raise self.state_error
+        state = self.states.get(order_id)
+        if state is None:
+            raise OrderNotFound(f"нет заявки {order_id}", http_status=400)
+        return {"order_id": order_id, "request_id": "", "figi": "F",
+                "lots_requested": 0, "lots_executed": 0, "price": 0.0,
+                "total": 0.0, "commission": 0.0, "stages": [], "raw": {},
+                **state}
 
     def instrument_by_uid(self, uid):
         return {"lot": self.lot, "ticker": "TEST", "figi": "F"}
@@ -283,9 +372,7 @@ class UrlWatches(JournalCase):
             "u", "", "url_changed", 0.0, "ждём МСФО", time.time() + 3600,
             url="u", content_hash=marketdata.page_hash("u"),
         )
-        worker = watcher.Watcher(
-            supervisor_main.Supervisor._watches_fired, lambda: False, lambda: None
-        )
+        worker = watcher.Watcher(lambda: False, lambda: None)
         # Ничего не изменилось — тишина, и наблюдатель остаётся.
         self.assertEqual(worker.tick_urls(), [])
         self.assertEqual(len(journal.active_watches()), 1)
@@ -308,7 +395,7 @@ class UrlWatches(JournalCase):
             "u", "", "url_changed", 0.0, "ждём", time.time() + 3600,
             url="u", content_hash="старый",
         )
-        worker = watcher.Watcher(lambda t: None, lambda: False, lambda: None)
+        worker = watcher.Watcher(lambda: False, lambda: None)
         self.assertEqual(worker.tick_urls(), [])
         self.assertEqual(len(journal.active_watches()), 1)
 
@@ -399,6 +486,51 @@ class ProtocolShapes(JournalCase):
         supervisor_main.Supervisor._record_usage({"turnId": "t5", "tokenUsage": {"last": 5}})
         self.assertEqual(journal.usage_since(3600)["turns"], 1)
 
+    def test_ход_завершившийся_раньше_ответа_не_считается_идущим(self):
+        """Событие приходит отдельным потоком и может обогнать ответ.
+
+        Раньше start_turn выставлял busy безусловно: если turn/completed
+        успевал первым, супервизор навсегда решал, что агент занят, и
+        переставал что-либо доставлять.
+        """
+        from supervisor import appserver
+
+        class Fake(appserver.AppServer):
+            def __init__(self):
+                self.thread_id = "T"
+                self.turn_id = ""
+                self.busy = False
+                self.turn_started = 0.0
+                self._completed = []
+
+            def request(self, method, params, timeout=120):
+                # Ход успел закончиться, пока шёл ответ на его запуск.
+                self._track({"method": "turn/completed", "params": {"turnId": "t9"}})
+                return {"turn": {"id": "t9"}}
+
+        codex = Fake()
+        self.assertEqual(codex.start_turn("привет"), "t9")
+        self.assertFalse(codex.busy)
+        self.assertEqual(codex.turn_id, "")
+
+    def test_обычный_ход_считается_идущим(self):
+        from supervisor import appserver
+
+        class Fake(appserver.AppServer):
+            def __init__(self):
+                self.thread_id = "T"
+                self.turn_id = ""
+                self.busy = False
+                self.turn_started = 0.0
+                self._completed = []
+
+            def request(self, method, params, timeout=120):
+                return {"turn": {"id": "t10"}}
+
+        codex = Fake()
+        self.assertEqual(codex.start_turn("привет"), "t10")
+        self.assertTrue(codex.busy)
+
     def test_подтверждение_получает_решение_а_не_ошибку(self):
         from supervisor import appserver
 
@@ -443,3 +575,57 @@ class ProtocolShapes(JournalCase):
 
         self.assertNotIn("usage", ("completedAt", "durationMs", "error", "id",
                                    "items", "itemsView", "startedAt", "status"))
+
+
+class Recovery(JournalCase):
+    """Восстановление начинается со сверки, а не с новых сделок."""
+
+    def setUp(self):
+        super().setUp()
+        from gateway import server
+        from tests.support import FakeBroker, flat_bars
+
+        self.broker = FakeBroker(bars=flat_bars())
+        server._client = self.broker
+        reconcile._client = self.broker
+
+    def intent(self, request_id="r1"):
+        journal.create_intent({
+            "request_id": request_id, "instrument_id": "uid", "ticker": "TEST",
+            "direction": "buy", "order_type": "market", "lots": 1,
+        })
+
+    def test_нечего_проверять(self):
+        self.assertEqual(reconcile.recover_intents()["checked"], 0)
+
+    def test_невыясненное_остаётся_блокирующим(self):
+        from gateway.tinvest import TInvestError
+
+        self.intent()
+        self.broker.state_error = TInvestError("нет связи", retryable=True, answered=False)
+        report = reconcile.recover_intents()
+        self.assertEqual(report["resolved"], 0)
+        self.assertEqual(len(report["blocked"]), 1)
+        self.assertEqual(len(journal.blocking_intents()), 1)
+
+    def test_исполнившаяся_заявка_записывается_в_журнал(self):
+        """Заявка, чей ответ на отправку потерялся, существует только на счёте.
+
+        UPDATE по несуществующей строке молча не делает ничего, и такая
+        сделка не видна ни дневным лимитам, ни расчёту риска, ни сверке.
+        """
+        self.intent()
+        conn = journal.connect()
+        conn.execute("UPDATE order_intents SET ts = ts - 600")
+        conn.commit()
+        self.broker.states["r1"] = {
+            "status": "EXECUTION_REPORT_STATUS_FILL", "order_id": "exch-77",
+            "lots_requested": 1, "lots_executed": 1, "price": 100.0,
+        }
+        report = reconcile.recover_intents()
+        self.assertEqual(report["resolved"], 1)
+        row = conn.execute("SELECT * FROM orders WHERE order_id='exch-77'").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["lots_executed"], 1)
+        self.assertEqual(row["ticker"], "TEST")
+        self.assertEqual(journal.blocking_intents(), [])

@@ -225,12 +225,29 @@ main{padding:6px 18px 40px;max-width:760px;margin:0 auto}
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); tg.setHeaderColor?.('#100f0e'); tg.setBackgroundColor?.('#100f0e'); }
 
-const KEY = new URLSearchParams(location.search).get('k') || '';
+// Ключ приходит ссылкой один раз: забираем его из адреса, убираем оттуда и
+// дальше носим заголовком. В строке запроса он оседал бы в логах сервера, в
+// истории браузера и в Referer при переходе на любой внешний ресурс.
+const KEY = (() => {
+  const url = new URL(location.href);
+  const fromLink = url.searchParams.get('k');
+  if (fromLink) {
+    try { sessionStorage.setItem('panel-key', fromLink); } catch {}
+    url.searchParams.delete('k');
+    history.replaceState(null, '', url.pathname + url.search + url.hash);
+    return fromLink;
+  }
+  try { return sessionStorage.getItem('panel-key') || ''; } catch { return ''; }
+})();
+
+const auth = () => ({
+  ...(KEY ? { 'X-Panel-Key': KEY } : {}),
+  ...(tg?.initData ? { 'X-Telegram-Init-Data': tg.initData } : {})
+});
+
 const api = async (path, params = {}) => {
-  const q = new URLSearchParams({ ...params, ...(KEY ? { k: KEY } : {}) });
-  const r = await fetch(`${path}?${q}`, {
-    headers: tg?.initData ? { 'X-Telegram-Init-Data': tg.initData } : {}
-  });
+  const q = new URLSearchParams(params);
+  const r = await fetch(`${path}?${q}`, { headers: auth() });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 };
@@ -521,10 +538,9 @@ async function send() {
     ? 'Агент занят — сообщение придёт в текущий ход'
     : 'Отправлено, будит агента…';
   try {
-    const r = await fetch('/api/say' + (KEY ? `?k=${KEY}` : ''), {
+    const r = await fetch('/api/say', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json',
-                 ...(tg?.initData ? { 'X-Telegram-Init-Data': tg.initData } : {}) },
+      headers: { 'Content-Type': 'application/json', ...auth() },
       body: JSON.stringify({ text })
     });
     if (!r.ok) throw new Error();

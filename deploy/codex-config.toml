@@ -40,6 +40,9 @@ tool_timeout_sec = 200
 AGENT_DB = "/home/agent/state/agent.db"
 AGENT_DATA_DIR = "/home/agent/data"
 AGENT_WORKDIR = "/home/agent/work"
+# Реестр попыток: отдельный файл, чтобы исследованию незачем было открывать
+# журнал заявок. Инструмент backtest пишет сюда.
+RESEARCH_DB = "/home/agent/state/research.db"
 PYTHONPATH = "/opt/tinvest-agent"
 
 [projects."/home/agent/work"]

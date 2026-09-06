@@ -33,6 +33,11 @@ APPROVAL_REQUESTS = {
 INPUT_REQUESTS = {"item/tool/requestUserInput"}
 
 
+def _turn_id(payload: dict) -> str:
+    """Идентификатор хода. Протокол кладёт его то полем, то внутрь объекта."""
+    return (payload.get("turn") or {}).get("id", "") or payload.get("turnId", "")
+
+
 class AppServerError(RuntimeError):
     pass
 
@@ -60,6 +65,9 @@ class AppServer:
         self.thread_id: str = ""
         self.turn_id: str = ""
         self.busy: bool = False
+        # Идентификаторы завершившихся ходов: короткая память против гонки
+        # между ответом на turn/start и событием turn/completed.
+        self._completed: list[str] = []
         # Момент последнего входящего события. Отдельно от времени доставки:
         # иначе периодическая доставка «оживляет» зависший ход, и сторожок
         # никогда не срабатывает.
@@ -227,10 +235,18 @@ class AppServer:
             return  # событие субагента, состояние основного не трогаем
 
         if method == "turn/started":
-            self.turn_id = params.get("turnId") or (params.get("turn") or {}).get("id", "")
+            self.turn_id = _turn_id(params)
             self.busy = True
             self.turn_started = time.time()
         elif method == "turn/completed":
+            finished = _turn_id(params)
+            if finished:
+                # Ход мог завершиться раньше, чем вернулся ответ на его
+                # запуск: события приходят отдельным потоком. Помним, что он
+                # закончился, иначе start_turn выставит busy на уже мёртвый
+                # ход, и супервизор навсегда решит, что агент занят.
+                self._completed.append(finished)
+                del self._completed[:-50]
             self.busy = False
             self.turn_id = ""
             self.turn_started = 0.0
@@ -288,10 +304,15 @@ class AppServer:
             {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]},
             timeout=120,
         )
-        turn = result.get("turn") or {}
-        self.turn_id = turn.get("id") or result.get("turnId", "")
+        turn_id = _turn_id(result)
+        if turn_id and turn_id in self._completed:
+            # Уже закончился. Занятым его объявлять нельзя.
+            self.busy = False
+            self.turn_id = ""
+            return turn_id
+        self.turn_id = turn_id
         self.busy = True
-        return self.turn_id
+        return turn_id
 
     def steer(self, text: str) -> bool:
         """Доставить сообщение в идущий ход. False — если хода нет."""

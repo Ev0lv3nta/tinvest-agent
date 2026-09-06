@@ -3,7 +3,7 @@
 import unittest
 
 from gateway import config, guards, journal
-from tests.support import JournalCase, add_order, msk
+from tests.support import JournalCase, add_order, add_playbook, msk
 
 
 class TradeCard(JournalCase):
@@ -52,6 +52,104 @@ class TradeCard(JournalCase):
     def test_цель_ниже_входа_отклоняется(self):
         with self.assertRaises(guards.GuardRejection):
             guards.check_trade_card(100.0, 95.0, 99.0, 1, 1, "TEST")
+
+
+class CardValidation(JournalCase):
+    """Карточка — это измерение. Числа в ней обязаны быть числами."""
+
+    def test_бесконечная_цель_отбивается(self):
+        # Бесконечность проходит любое сравнение «больше»: отношение
+        # прибыли к риску бесконечно, доля цели бесконечна, и все три
+        # барьера отвечают «да» на бессмысленный вход.
+        with self.assertRaises(guards.GuardRejection) as caught:
+            guards.check_trade_card(100.0, 97.0, float("inf"), 1, 1, "TEST")
+        self.assertIn("конечным", str(caught.exception))
+
+    def test_nan_отбивается(self):
+        with self.assertRaises(guards.GuardRejection):
+            guards.check_trade_card(100.0, float("nan"), 110.0, 1, 1, "TEST")
+
+    def test_бесконечный_стоп_отбивается(self):
+        with self.assertRaises(guards.GuardRejection):
+            guards.check_trade_card(100.0, float("-inf"), 110.0, 1, 1, "TEST")
+
+    def test_дробные_лоты_отбиваются(self):
+        with self.assertRaises(guards.GuardRejection):
+            guards.check_trade_card(100.0, 97.0, 110.0, 1.5, 1, "TEST")
+
+
+class Playbooks(JournalCase):
+    """Сетап — запись с числами, сделанная до сделки, а не строка в заявке."""
+
+    def test_незарегистрированный_отбивается(self):
+        with self.assertRaises(guards.GuardRejection) as caught:
+            guards.check_playbook("выглядит-перспективно", 100.0)
+        self.assertIn("не зарегистрирован", str(caught.exception))
+
+    def test_проверенный_торгуется_полным_размером(self):
+        add_playbook(trades=40, wins=24, avg_r=0.4)
+        record = guards.check_playbook("test", config.MAX_RISK_PER_TRADE)
+        self.assertEqual(record["status"], "working")
+
+    def test_новый_сетап_только_четвертью(self):
+        add_playbook(trades=3, wins=2, avg_r=0.5)
+        limit = config.MAX_RISK_PER_TRADE * config.PROBATION_RISK_FRACTION
+        guards.check_playbook("test", limit)
+        with self.assertRaises(guards.GuardRejection) as caught:
+            guards.check_playbook("test", limit + 1)
+        self.assertIn("на проверке", str(caught.exception))
+
+    def test_свои_слова_не_дают_полного_размера(self):
+        """Числа, записанные агентом, остаются на проверке навсегда.
+
+        Реестр хранит и то, откуда взялась статистика. Запись со слов не
+        становится измерением от того, что цифры выглядят убедительно.
+        """
+        add_playbook(trades=200, wins=140, avg_r=0.9, source="manual")
+        record = journal.playbook("test")
+        self.assertEqual(record["status"], "probation")
+        with self.assertRaises(guards.GuardRejection) as caught:
+            guards.check_playbook("test", config.MAX_RISK_PER_TRADE)
+        self.assertIn("с твоих слов", str(caught.exception))
+
+    def test_неизвестный_источник_отбивается(self):
+        with self.assertRaises(ValueError):
+            journal.register_playbook(
+                {"name": "x", "entry": "a", "invalidation": "b", "measured_on": "c",
+                 "trades": 1, "wins": 1, "avg_r": 0.1, "source": "внушает-доверие"}
+            )
+
+    def test_отрицательная_база_не_даёт_полного_размера(self):
+        # Сделок хватает, но средний результат отрицательный.
+        add_playbook(trades=40, wins=10, avg_r=-0.3)
+        with self.assertRaises(guards.GuardRejection):
+            guards.check_playbook("test", config.MAX_RISK_PER_TRADE)
+
+    def test_снятый_сетап_не_торгуется(self):
+        add_playbook()
+        journal.retire_playbook("test", "проверка на истории дала отрицательную базу")
+        with self.assertRaises(guards.GuardRejection) as caught:
+            guards.check_playbook("test", 1.0)
+        self.assertIn("снят с торговли", str(caught.exception))
+
+    def test_статистика_обновляется_без_потери_даты(self):
+        first = add_playbook(trades=3, wins=1, avg_r=-0.1)
+        self.assertEqual(first["status"], "probation")
+        second = add_playbook(trades=20, wins=12, avg_r=0.5)
+        self.assertEqual(second["status"], "working")
+        self.assertEqual(len(journal.playbooks()), 1)
+
+
+class PortfolioHeat(JournalCase):
+    def test_две_идеи_складываются(self):
+        # Каждая по отдельности меньше 1R, вместе — больше потолка портфеля.
+        guards.check_portfolio_heat(900.0, 900.0, "TEST")
+        with self.assertRaises(guards.GuardRejection) as caught:
+            guards.check_portfolio_heat(900.0, 1_200.0, "TEST")
+        self.assertIn("под риском", str(caught.exception))
+
+    def test_первый_вход_проходит(self):
+        guards.check_portfolio_heat(config.MAX_RISK_PER_TRADE, 0.0, "TEST")
 
 
 class HaltSemantics(JournalCase):

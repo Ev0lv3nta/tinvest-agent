@@ -32,7 +32,20 @@ RETRYABLE_CODES = {"70001", "70002", "80002"}
 
 
 class TInvestError(RuntimeError):
-    """Ошибка API. `code` — числовой код T-Invest (например, 30079)."""
+    """Ошибка API. `code` — числовой код T-Invest (например, 30079).
+
+    `answered` — ключевое поле для заявок. True означает, что брокер
+    ответил по существу: запрос до него дошёл, был разобран и отклонён.
+    False означает, что ответа мы не получили — и тогда судьба заявки
+    неизвестна, потому что она могла быть принята.
+
+    Разница не косметическая. Раньше обрыв связи заворачивался в тот же
+    TInvestError, что и отказ брокера, шлюз объявлял заявку отклонённой и
+    закрывал ключ идемпотентности. Следующая попытка уходила с новым
+    ключом — и создавала вторую позицию поверх первой, о которой мы не
+    знали. Ветка «связь оборвалась» при этом выглядела написанной, но до
+    неё не доходило управление ни разу.
+    """
 
     def __init__(
         self,
@@ -40,15 +53,44 @@ class TInvestError(RuntimeError):
         code: str = "",
         http_status: int = 0,
         retryable: Optional[bool] = None,
+        answered: Optional[bool] = None,
     ):
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+        self.answered = (
+            answered if answered is not None else _looks_answered(code, http_status)
+        )
         self.retryable = (
             retryable
             if retryable is not None
             else (code in RETRYABLE_CODES or http_status in (429, 500, 502, 503, 504))
         )
+
+    @property
+    def ambiguous(self) -> bool:
+        """Судьба запроса неизвестна: повторять вслепую нельзя."""
+        return not self.answered
+
+
+def _looks_answered(code: str, http_status: int) -> bool:
+    """Похоже ли это на ответ брокера по существу.
+
+    Дефолт выбран в безопасную сторону: лишняя блокировка стоит паузы,
+    лишнее разрешение — второй позиции поверх первой. Поэтому ответом
+    считается только разобранный отказ, а не всякая ошибка.
+
+    Внутренняя ошибка сервера ответом не является, даже когда у неё есть
+    код: запрос до брокера дошёл, а был ли применён — из такого ответа не
+    следует.
+    """
+    if code in RETRYABLE_CODES or http_status >= 500:
+        return False
+    return bool(code or 0 < http_status < 500)
+
+
+class OrderNotFound(TInvestError):
+    """Брокер ответил, что такой заявки у него нет. Не «мы не смогли спросить»."""
 
 
 def journal_retry(service: str, method: str, exc: "TInvestError", attempt: int) -> None:
@@ -120,7 +162,9 @@ class SandboxClient:
                 journal_retry(service, method, exc, attempt + 1)
                 time.sleep(delay)
                 delay *= 2
-        raise TInvestError(f"{service}/{method}: не удалось после {retries} повторов")
+        raise TInvestError(
+            f"{service}/{method}: не удалось после {retries} повторов", answered=False
+        )
 
     def _call_once(self, service: str, method: str, payload: Optional[dict] = None) -> dict:
         url = f"{config.TINVEST_SANDBOX_URL}/{config.TINVEST_NS}.{service}/{method}"
@@ -148,16 +192,26 @@ class SandboxClient:
                 code = str(parsed.get("description") or parsed.get("code") or "")
             except ValueError:
                 message, code = raw[:400], ""
+            # 4xx — брокер разобрал запрос и отказал: ответ содержательный.
+            # 5xx — сбой на его стороне уже после приёма запроса, и был ли
+            # запрос применён, из ответа не следует.
             raise TInvestError(
-                f"{service}/{method}: {message}", code=code, http_status=exc.code
+                f"{service}/{method}: {message}",
+                code=code,
+                http_status=exc.code,
+                answered=exc.code < 500,
             ) from exc
         except urllib.error.URLError as exc:
             raise TInvestError(
-                f"{service}/{method}: сеть недоступна ({exc.reason})", retryable=True
+                f"{service}/{method}: сеть недоступна ({exc.reason})",
+                retryable=True,
+                answered=False,
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise TInvestError(
-                f"{service}/{method}: обрыв связи ({exc})", retryable=True
+                f"{service}/{method}: обрыв связи ({exc})",
+                retryable=True,
+                answered=False,
             ) from exc
 
     def _sandbox(self, method: str, payload: Optional[dict] = None) -> dict:
@@ -286,20 +340,85 @@ class SandboxClient:
         if price is not None:
             payload["price"] = _to_quotation(price)
         raw = self._sandbox("PostSandboxOrder", payload)
+        state = self._order_state(raw)
+        state["message"] = raw.get("message")
+        return state
+
+    def order_state(self, order_id: str, by_request_id: bool = False) -> dict:
+        """Точное состояние одной заявки.
+
+        Единственный способ узнать судьбу заявки. Раньше вывод делался из
+        отсутствия в списке активных: заявка исчезла — значит отменена. Но
+        из активных исчезает и исполненная, и отклонённая, и та, о которой
+        брокер просто не ответил в этот раз.
+
+        `by_request_id` спрашивает по нашему собственному ключу, который мы
+        передавали в `orderId` при отправке. Это разные идентификаторы:
+        брокер возвращает свой, а ищет по обоим — но только если явно
+        сказать, какой из них передан.
+        """
+        payload: dict[str, Any] = {
+            "accountId": self.account_id,
+            "orderId": order_id,
+            "orderIdType": (
+                "ORDER_ID_TYPE_REQUEST" if by_request_id else "ORDER_ID_TYPE_EXCHANGE"
+            ),
+        }
+        try:
+            raw = self.call("SandboxService", "GetSandboxOrderState", payload)
+        except TInvestError as exc:
+            # Содержательный отказ по существующему запросу означает, что
+            # такой заявки у брокера нет. Всё остальное — незнание.
+            if exc.answered and 400 <= exc.http_status < 500:
+                raise OrderNotFound(str(exc), code=exc.code, http_status=exc.http_status)
+            raise
+        return self._order_state(raw)
+
+    @staticmethod
+    def _order_state(raw: dict) -> dict:
+        """Разбор состояния заявки.
+
+        Комиссия берётся из `executedCommission`: `initialCommission` — это
+        оценка на момент выставления, а не то, что списали.
+        """
+        stages = raw.get("stages") or []
         return {
             "order_id": raw.get("orderId"),
-            "status": raw.get("executionReportStatus"),
+            "request_id": raw.get("orderRequestId") or "",
+            "status": raw.get("executionReportStatus") or "",
+            "direction": raw.get("direction") or "",
+            "instrument_id": raw.get("instrumentUid") or "",
+            "figi": raw.get("figi") or "",
             "lots_requested": int(raw.get("lotsRequested") or 0),
             "lots_executed": int(raw.get("lotsExecuted") or 0),
             "price": _money(raw.get("executedOrderPrice")),
             "total": _money(raw.get("totalOrderAmount")),
-            "commission": _money(raw.get("initialCommission")),
-            "message": raw.get("message"),
+            "commission": _money(
+                raw.get("executedCommission") or raw.get("initialCommission")
+            ),
+            "stages": [
+                {
+                    "price": _money(stage.get("price")),
+                    "quantity": int(stage.get("quantity") or 0),
+                    "trade_id": stage.get("tradeId"),
+                }
+                for stage in stages
+            ],
             "raw": raw,
         }
 
-    def cancel_order(self, order_id: str) -> str:
-        raw = self._sandbox("CancelSandboxOrder", {"orderId": order_id})
+    def cancel_order(self, order_id: str, by_request_id: bool = False) -> str:
+        """Снять заявку. Идентификатор бывает двух видов, и брокер должен
+        знать, какой из них передан: наш ключ или его собственный."""
+        raw = self._sandbox(
+            "CancelSandboxOrder",
+            {
+                "orderId": order_id,
+                "orderIdType": (
+                    "ORDER_ID_TYPE_REQUEST" if by_request_id else "ORDER_ID_TYPE_EXCHANGE"
+                ),
+            },
+        )
         return raw.get("time", "")
 
     def active_orders(self) -> list[dict]:
@@ -307,6 +426,7 @@ class SandboxClient:
         return [
             {
                 "order_id": item.get("orderId"),
+                "request_id": item.get("orderRequestId") or "",
                 "figi": item.get("figi"),
                 "instrument_id": item.get("instrumentUid"),
                 "direction": item.get("direction"),
@@ -394,13 +514,23 @@ class SandboxClient:
 
     def candles(self, instrument_id: str, interval: str, days: int) -> list[dict]:
         now = datetime.now(timezone.utc)
+        return self.candles_between(
+            instrument_id, interval, now - timedelta(days=days), now
+        )
+
+    def candles_between(
+        self, instrument_id: str, interval: str, start: datetime, end: datetime
+    ) -> list[dict]:
+        """Явный отрезок. Длинная история берётся окнами: API отдаёт
+        ограниченный диапазон за запрос, и просить сразу год минутных свечей
+        бессмысленно."""
         raw = self.call(
             "MarketDataService",
             "GetCandles",
             {
                 "instrumentId": instrument_id,
-                "from": _utc(now - timedelta(days=days)),
-                "to": _utc(now),
+                "from": _utc(start),
+                "to": _utc(end),
                 "interval": interval,
             },
         )
@@ -412,6 +542,10 @@ class SandboxClient:
                 "low": _money(item.get("low")),
                 "close": _money(item.get("close")),
                 "volume": int(item.get("volume") or 0),
+                # Незавершённый бар нельзя считать наблюдением: он ещё
+                # изменится. Раньше признак терялся, и последний бар просто
+                # отрезали — вместе с завершённым баром закрытого дня.
+                "complete": bool(item.get("isComplete")),
             }
             for item in raw.get("candles", [])
         ]

@@ -15,7 +15,13 @@ import time
 from typing import Optional
 
 from gateway import config, journal
-from gateway.tinvest import SandboxClient, TInvestError
+from gateway.tinvest import OrderNotFound, SandboxClient, TInvestError
+
+INTENT_BY_STATUS = {
+    "EXECUTION_REPORT_STATUS_FILL": "filled",
+    "EXECUTION_REPORT_STATUS_CANCELLED": "cancelled",
+    "EXECUTION_REPORT_STATUS_REJECTED": "rejected",
+}
 
 # Сделка, оформленная через шлюз, появляется в операциях не мгновенно;
 # допуск с запасом, чтобы не ловить ложные срабатывания на задержке.
@@ -57,46 +63,89 @@ def _direction(operation_type: str) -> str:
 def sync_orders() -> int:
     """Довести записи о заявках до фактического состояния у брокера.
 
-    Раньше сохранялся только первый ответ PostOrder: лимитка, исполнившаяся
-    через минуту, навсегда оставалась NEW с нулём лотов, отмена не
-    записывалась, и панель считала «сделками» сами обращения к брокеру.
+    Состояние спрашивается точно, по идентификатору каждой заявки. Раньше
+    оно выводилось из списка активных: заявки нет в списке — значит
+    отменена с нулевым исполнением. Но из активных исчезает и исполненная,
+    и отклонённая, а при сбое чтения список приходит пустым целиком — и
+    тогда все наши заявки разом записывались отменёнными.
     """
     ours = journal.open_orders()
     if not ours:
         return 0
-    try:
-        live = {order["order_id"]: order for order in client().active_orders()}
-    except TInvestError as exc:
-        journal.log_event("order_sync_failed", {"error": str(exc)[:200]})
-        return 0
 
     changed = 0
     for row in ours:
-        order = live.get(row["order_id"])
-        if order:
-            if (
-                order["status"] != row["status"]
-                or order["lots_executed"] != (row["lots_executed"] or 0)
-            ):
-                journal.update_order_status(
-                    row["order_id"], order["status"], order["lots_executed"],
-                    order.get("price") or 0.0,
-                )
-                changed += 1
+        try:
+            state = client().order_state(row["order_id"])
+        except OrderNotFound:
+            # Брокер отвечает, что такой заявки нет. Для заявки, которую мы
+            # отправляли и на которую получили идентификатор, это само по
+            # себе расхождение, а не разрешение придумать статус.
+            journal.log_event(
+                "order_missing",
+                {"order_id": row["order_id"], "ticker": row["ticker"]},
+            )
             continue
-        # Заявки нет среди активных: она исполнена, отменена или отклонена.
-        # Точный статус доспросить нечем, поэтому фиксируем по факту.
-        if (row["lots_executed"] or 0) >= row["lots"]:
-            status = "EXECUTION_REPORT_STATUS_FILL"
-        elif (row["lots_executed"] or 0) > 0:
-            status = "EXECUTION_REPORT_STATUS_PARTIALLYFILL"
-        else:
-            status = "EXECUTION_REPORT_STATUS_CANCELLED"
-        journal.close_order(row["order_id"], status)
+        except TInvestError as exc:
+            journal.log_event(
+                "order_sync_failed",
+                {"order_id": row["order_id"], "error": str(exc)[:200]},
+            )
+            continue
+
+        status = state.get("status") or ""
+        executed = state.get("lots_executed") or 0
+        if status == row["status"] and executed == (row["lots_executed"] or 0):
+            continue
+        journal.update_order_status(
+            row["order_id"], status, executed, state.get("price") or 0.0
+        )
+        # Намерение живёт вместе с заявкой: заявка дошла до конца — намерение
+        # тоже, иначе оно продолжало бы блокировать бумагу.
+        intent = journal.intent_by_order(row["order_id"])
+        if intent is not None and journal.is_terminal(status):
+            journal.set_intent_state(
+                intent["request_id"], INTENT_BY_STATUS.get(status, "filled"), status
+            )
         changed += 1
     if changed:
         journal.log_event("orders_synced", {"updated": changed})
     return changed
+
+
+def recover_intents() -> dict:
+    """Выяснить судьбу всех незакрытых намерений до начала торговли.
+
+    Восстановление начинается со сверки, а не с новых сделок. Процесс мог
+    упасть между записью намерения и ответом брокера; заявка при этом могла
+    исполниться. Пока это не выяснено, вход по бумаге закрыт — и лучше
+    выяснить один раз на старте, чем в момент, когда агент решил купить.
+
+    Ничего не «истекает»: то, что осталось невыясненным, остаётся
+    блокирующим и попадает в отчёт оператору.
+    """
+    from gateway import server
+
+    pending = journal.blocking_intents()
+    if not pending:
+        return {"checked": 0, "resolved": 0, "blocked": []}
+
+    resolved = 0
+    blocked = []
+    for intent in pending:
+        ticker = intent["ticker"] or intent["instrument_id"][:8]
+        try:
+            why = server._resolve_intent(intent, ticker)
+        except Exception as exc:  # noqa: BLE001 — восстановление не должно падать
+            why = f"проверить не удалось ({type(exc).__name__}: {exc})"
+        if why:
+            blocked.append({"request_id": intent["request_id"], "ticker": ticker, "why": why})
+        else:
+            resolved += 1
+
+    report = {"checked": len(pending), "resolved": resolved, "blocked": blocked}
+    journal.log_event("intents_recovered", report)
+    return report
 
 
 def _lot_size(figi: str, instrument_id: str) -> int:
