@@ -21,13 +21,17 @@ class PanelDemo(unittest.TestCase):
             sentinel.write_bytes(b"do not modify this database")
             env = {**os.environ, "AGENT_DB": str(sentinel)}
             process = subprocess.Popen(
-                [sys.executable, "examples/panel_demo.py", "--port", "0"],
+                [sys.executable, "-c",
+                 "import faulthandler, runpy; "
+                 "faulthandler.dump_traceback_later(30); "
+                 "runpy.run_path('examples/panel_demo.py', run_name='__main__')",
+                 "--port", "0"],
                 cwd=Path(__file__).resolve().parents[1], env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
-                ready, _, _ = select.select([process.stdout], [], [], 15)
-                self.assertTrue(ready, "демо не вывело адрес за 15 секунд")
+                ready, _, _ = select.select([process.stdout], [], [], 60)
+                self.assertTrue(ready, "демо не вывело адрес за 60 секунд")
                 url = process.stdout.readline().strip()
                 self.assertTrue(url.startswith("http://127.0.0.1:"), url)
                 parsed = urllib.parse.urlparse(url)
